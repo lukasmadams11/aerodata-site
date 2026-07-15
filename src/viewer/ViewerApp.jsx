@@ -1,0 +1,845 @@
+import React, { useEffect, useRef, useState } from "react";
+import {
+  Crosshair,
+  FolderOpen,
+  HelpCircle,
+  Map,
+  Minus,
+  Mountain,
+  Plus,
+  RotateCcw,
+  Sparkles,
+  X,
+  ZoomIn,
+  ZoomOut,
+} from "lucide-react";
+import { CLASS_LEGEND } from "./classLegend.js";
+
+/* ------------------------------------------------------------------ */
+/*  Device budgets                                                     */
+/*  navigator.deviceMemory is Chromium-only — Safari (all iOS/iPadOS   */
+/*  browsers) and Firefox never expose it — so when the hint is absent */
+/*  fall back to a mobile-class check. iPadOS Safari masquerades as    */
+/*  desktop macOS, so iPads are caught via Macintosh+maxTouchPoints.   */
+/* ------------------------------------------------------------------ */
+
+const IS_CONSTRAINED = (() => {
+  if (typeof navigator === "undefined") return false;
+  if (navigator.deviceMemory !== undefined) return navigator.deviceMemory <= 4;
+  const ua = navigator.userAgent || "";
+  if (/Android|iPhone|iPad|iPod|Mobile/i.test(ua)) return true;
+  return /Macintosh/i.test(ua) && navigator.maxTouchPoints > 1;
+})();
+
+const POINT_BUDGET = IS_CONSTRAINED ? 2000000 : 4500000;
+/* LAZ peaks at ~1x file inside the wasm heap; LAS is streamed in blocks */
+const MAX_LAZ_BYTES = (IS_CONSTRAINED ? 300 : 500) * 1024 * 1024;
+const MAX_LAS_BYTES = (IS_CONSTRAINED ? 600 : 1600) * 1024 * 1024;
+
+const TOO_LARGE_MSG =
+  "This file is too large to open in a web browser. Contact us and we'll send a lighter version of the scan.";
+
+const COLOR_MODES = [
+  { id: "elevation", label: "Height" },
+  { id: "rgb", label: "True color" },
+  { id: "intensity", label: "Scanner brightness" },
+  { id: "classification", label: "Surface type" },
+];
+
+const formatPoints = (n) =>
+  n >= 1e6 ? `${(n / 1e6).toFixed(1)} million` : n.toLocaleString();
+
+/* Lazy-load the 3D chunk (three.js) only when a scan is actually opened */
+let scenePromise = null;
+const loadSceneModule = () => (scenePromise ??= import("./PointCloudScene.js"));
+
+function Logo() {
+  return (
+    <a href="./" className="flex items-center gap-2.5" title="Back to AeroData home">
+      <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-cyan-400/40 bg-cyan-400/10">
+        <Crosshair className="h-4 w-4 text-cyan-300" strokeWidth={1.75} />
+      </span>
+      <span className="font-display text-[15px] font-bold tracking-tight">
+        Aero<span className="text-cyan-400">Data</span>
+        <span className="ml-2 hidden font-mono text-[10px] font-normal uppercase tracking-hud-mid text-slate-400 sm:inline">
+          Scan Viewer
+        </span>
+      </span>
+    </a>
+  );
+}
+
+const toolbarBtn =
+  "flex min-h-11 items-center gap-2 rounded-lg px-4 py-2 text-sm text-slate-300 transition-colors hover:bg-white/5 hover:text-white";
+
+export default function ViewerApp() {
+  const [stage, setStage] = useState({ kind: "idle" });
+  const [dragOver, setDragOver] = useState(false);
+  const [colorMode, setColorMode] = useState("elevation");
+  const [pointSize, setPointSize] = useState(2);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [modeNotice, setModeNotice] = useState("");
+  const [announce, setAnnounce] = useState("");
+  const [slow, setSlow] = useState(false);
+
+  const workerRef = useRef(null);
+  const dataRef = useRef(null);
+  const sceneRef = useRef(null);
+  const mountRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const loadGenRef = useRef(0);
+  const abortRef = useRef(null);
+  const helpButtonRef = useRef(null);
+  const gotItRef = useRef(null);
+  const errorBtnRef = useRef(null);
+  const openAnotherRef = useRef(null);
+  const noticeTimerRef = useRef(null);
+  const lastAnnouncedRef = useRef({ phase: "", decile: -1 });
+
+  /* ---------------- load management ---------------- */
+
+  /* Supersede any in-flight load: abort downloads, kill the worker, and
+     advance the generation so stale async continuations bail out. */
+  const beginLoad = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    workerRef.current?.terminate();
+    workerRef.current = null;
+    return ++loadGenRef.current;
+  };
+  const isStale = (gen) => gen !== loadGenRef.current;
+
+  const startWorker = () => {
+    const worker = new Worker(new URL("./las-worker.js", import.meta.url), { type: "module" });
+    worker.onmessage = (e) => {
+      if (workerRef.current !== worker) return; /* stale message from a superseded worker */
+      const msg = e.data;
+      if (msg.type === "progress") {
+        setStage({ kind: "loading", percent: msg.percent, phase: msg.phase });
+      } else if (msg.type === "done") {
+        worker.terminate(); /* reclaim the worker (and any grown wasm heap) immediately */
+        workerRef.current = null;
+        dataRef.current = msg;
+        setColorMode(msg.rgb ? "rgb" : "elevation");
+        setPointSize(2);
+        setStage({
+          kind: "ready",
+          kept: msg.kept,
+          total: msg.total,
+          hasRgb: !!msg.rgb,
+          hasIntensity: msg.hasIntensity,
+        });
+      } else if (msg.type === "error") {
+        worker.terminate();
+        workerRef.current = null;
+        setStage({ kind: "error", message: msg.message });
+      }
+    };
+    worker.onerror = () => {
+      if (workerRef.current !== worker) return;
+      worker.terminate();
+      workerRef.current = null;
+      setStage({
+        kind: "error",
+        message: "Something went wrong while reading this file. If it keeps happening, contact us and we'll help.",
+      });
+    };
+    workerRef.current = worker;
+    return worker;
+  };
+
+  const openFile = (file) => {
+    if (!file) return;
+    const viewing = sceneRef.current !== null;
+    const isLaz = /\.laz$/i.test(file.name);
+    const isLas = /\.las$/i.test(file.name);
+    if (!isLas && !isLaz) {
+      if (viewing) return; /* ignore an accidental mis-drop; keep the current 3D view */
+      beginLoad();
+      setStage({
+        kind: "error",
+        message: `"${file.name}" isn't a scan file. Please choose the file ending in .las or .laz that we sent you.`,
+      });
+      return;
+    }
+    if ((isLaz && file.size > MAX_LAZ_BYTES) || (isLas && file.size > MAX_LAS_BYTES)) {
+      if (viewing) return;
+      beginLoad();
+      setStage({ kind: "error", message: TOO_LARGE_MSG });
+      return;
+    }
+    beginLoad();
+    loadSceneModule();
+    setStage({ kind: "loading", percent: 0, phase: "Opening the file…" });
+    /* Files structured-clone by reference — the worker streams it in chunks */
+    startWorker().postMessage({ type: "parse", file, budget: POINT_BUDGET });
+  };
+
+  const openDemo = () => {
+    beginLoad();
+    loadSceneModule();
+    setStage({ kind: "loading", percent: 0, phase: "Building the demo scan…" });
+    startWorker().postMessage({ type: "demo", budget: POINT_BUDGET });
+  };
+
+  const openUrl = async (src) => {
+    const gen = beginLoad();
+    const ac = new AbortController();
+    abortRef.current = ac;
+    loadSceneModule();
+    let reader = null;
+    try {
+      setStage({ kind: "loading", percent: 0, phase: "Downloading the scan…" });
+      let pathname = src;
+      try {
+        pathname = new URL(src, window.location.href).pathname;
+      } catch {
+        /* keep raw src */
+      }
+      /* unknown extensions get the stricter LAZ cap */
+      const cap = /\.las$/i.test(pathname) ? MAX_LAS_BYTES : MAX_LAZ_BYTES;
+
+      const res = await fetch(src, { signal: ac.signal });
+      if (isStale(gen)) return;
+      if (!res.ok) throw new Error();
+      const totalBytes = Number(res.headers.get("content-length")) || 0;
+      if (totalBytes > cap) {
+        res.body?.cancel();
+        setStage({ kind: "error", message: TOO_LARGE_MSG, retrySrc: src });
+        return;
+      }
+
+      reader = res.body.getReader();
+      const chunks = [];
+      let received = 0;
+      let lastUpdate = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (isStale(gen)) {
+          reader.cancel().catch(() => {});
+          return;
+        }
+        if (done) break;
+        chunks.push(value);
+        received += value.byteLength;
+        if (received > cap) {
+          reader.cancel().catch(() => {});
+          setStage({ kind: "error", message: TOO_LARGE_MSG, retrySrc: src });
+          return;
+        }
+        const now = performance.now();
+        if (now - lastUpdate > 150) {
+          lastUpdate = now;
+          setStage(
+            totalBytes
+              ? {
+                  kind: "loading",
+                  percent: Math.min(99, (received / totalBytes) * 100),
+                  phase: "Downloading the scan…",
+                }
+              : { kind: "loading", percent: null, receivedBytes: received, phase: "Downloading the scan…" }
+          );
+        }
+      }
+      if (isStale(gen)) return;
+      startWorker().postMessage({ type: "parse", file: new Blob(chunks), budget: POINT_BUDGET });
+    } catch {
+      if (isStale(gen)) return; /* aborted/superseded — not an error */
+      setStage({
+        kind: "error",
+        message: "The scan link couldn't be downloaded. Check the link, or contact us for a fresh one.",
+        retrySrc: src,
+      });
+    }
+  };
+
+  const reset = () => {
+    beginLoad();
+    dataRef.current = null;
+    setStage({ kind: "idle" });
+  };
+
+  /* load from ?src=… links */
+  useEffect(() => {
+    const src = new URLSearchParams(window.location.search).get("src");
+    if (src) openUrl(src);
+    return () => {
+      abortRef.current?.abort();
+      loadGenRef.current++;
+      workerRef.current?.terminate();
+      workerRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ---------------- drag & drop (files only) ---------------- */
+
+  useEffect(() => {
+    const isFileDrag = (e) => e.dataTransfer?.types?.includes("Files");
+    const onDragOver = (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      setDragOver(true);
+    };
+    const onDragLeave = (e) => {
+      if (!e.relatedTarget) setDragOver(false);
+    };
+    const onDrop = (e) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+      setDragOver(false);
+      const files = Array.from(e.dataTransfer.files || []);
+      openFile(files.find((f) => /\.la[sz]$/i.test(f.name)) || files[0]);
+    };
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("drop", onDrop);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ---------------- 3D scene lifecycle (lazy chunk) ---------------- */
+
+  useEffect(() => {
+    if (stage.kind !== "ready" || !mountRef.current) return;
+    let cancelled = false;
+    let scene = null;
+    loadSceneModule()
+      .then(({ PointCloudScene }) => {
+        if (cancelled || !mountRef.current) return;
+        scene = new PointCloudScene(mountRef.current);
+        scene.setData(dataRef.current);
+        sceneRef.current = scene;
+        window.__viewer = { stage: "ready", kept: dataRef.current.kept, total: dataRef.current.total, scene };
+      })
+      .catch(() => {
+        if (!cancelled)
+          setStage({ kind: "error", message: "The 3D viewer couldn't be loaded. Check your connection and try again." });
+      });
+    return () => {
+      cancelled = true;
+      if (scene) {
+        scene.dispose();
+        if (window.__viewer?.scene === scene) window.__viewer = null;
+      }
+      sceneRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage.kind]);
+
+  /* ---------------- announcements, focus, slow-load hint ---------------- */
+
+  useEffect(() => {
+    if (stage.kind === "loading") {
+      const decile = stage.percent == null ? -1 : Math.floor(stage.percent / 10);
+      const last = lastAnnouncedRef.current;
+      if (stage.phase !== last.phase || (decile !== -1 && decile !== last.decile)) {
+        lastAnnouncedRef.current = { phase: stage.phase, decile };
+        setAnnounce(decile > 0 ? `${stage.phase} ${decile * 10} percent.` : stage.phase);
+      }
+    } else {
+      lastAnnouncedRef.current = { phase: "", decile: -1 };
+      if (stage.kind === "ready") setAnnounce(`Scan loaded. ${formatPoints(stage.kept)} points shown.`);
+      else if (stage.kind === "idle") setAnnounce("");
+    }
+  }, [stage]);
+
+  useEffect(() => {
+    if (stage.kind === "error") errorBtnRef.current?.focus();
+    else if (stage.kind === "ready") openAnotherRef.current?.focus();
+  }, [stage.kind]);
+
+  useEffect(() => {
+    if (stage.kind !== "loading") {
+      setSlow(false);
+      return;
+    }
+    const t = setTimeout(() => setSlow(true), 8000);
+    return () => clearTimeout(t);
+  }, [stage.kind]);
+
+  /* ---------------- help dialog: focus trap + Escape + restore ---------------- */
+
+  useEffect(() => {
+    if (!helpOpen) return;
+    gotItRef.current?.focus();
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") {
+        setHelpOpen(false);
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const dialog = document.getElementById("help-dialog");
+      const focusables = dialog ? [...dialog.querySelectorAll("button")] : [];
+      if (!focusables.length) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      } else if (!dialog.contains(document.activeElement)) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown, true);
+      helpButtonRef.current?.focus();
+    };
+  }, [helpOpen]);
+
+  /* ---------------- toolbar handlers ---------------- */
+
+  const showNotice = (text) => {
+    setModeNotice(text);
+    clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = setTimeout(() => setModeNotice(""), 3500);
+  };
+  useEffect(() => () => clearTimeout(noticeTimerRef.current), []);
+
+  const changeColorMode = (mode, disabled, label) => {
+    if (disabled) {
+      showNotice(`This scan doesn't include ${label.toLowerCase()} information.`);
+      return;
+    }
+    setColorMode(mode);
+    sceneRef.current?.setColorMode(mode);
+  };
+  const changePointSize = (delta) => {
+    setPointSize((s) => {
+      const next = Math.min(6, Math.max(1, s + delta));
+      sceneRef.current?.setPointSize(next);
+      return next;
+    });
+  };
+
+  const onViewerKeyDown = (e) => {
+    const s = sceneRef.current;
+    if (!s) return;
+    const step = e.shiftKey ? 0.25 : 0.08;
+    switch (e.key) {
+      case "ArrowLeft":
+        s.orbit(step, 0);
+        break;
+      case "ArrowRight":
+        s.orbit(-step, 0);
+        break;
+      case "ArrowUp":
+        s.orbit(0, step);
+        break;
+      case "ArrowDown":
+        s.orbit(0, -step);
+        break;
+      case "+":
+      case "=":
+        s.zoomBy(1 / 1.2);
+        break;
+      case "-":
+      case "_":
+        s.zoomBy(1.2);
+        break;
+      case "r":
+      case "R":
+        s.fit();
+        break;
+      case "t":
+      case "T":
+        s.topView();
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+  };
+
+  /* ---------------- render ---------------- */
+
+  return (
+    <div className="flex h-dvh flex-col overflow-hidden bg-[#030609] font-sans text-slate-100">
+      {/* screen-reader status channel — persistent across stage changes */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {announce}
+      </div>
+
+      <header className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 bg-[#030609] px-4 sm:px-6">
+        <Logo />
+        {stage.kind === "ready" && (
+          <div className="flex items-center gap-4">
+            <span className="hidden font-mono text-[12px] tracking-hud-tight text-slate-400 md:block">
+              {stage.kept < stage.total
+                ? `Fast preview — ${formatPoints(stage.kept)} points`
+                : `${formatPoints(stage.kept)} points`}
+            </span>
+            <button
+              ref={openAnotherRef}
+              onClick={reset}
+              className="min-h-11 rounded-lg border border-white/15 px-4 py-2 text-sm text-slate-300 transition-colors hover:border-cyan-400/50 hover:text-cyan-300"
+            >
+              Open another file
+            </button>
+          </div>
+        )}
+      </header>
+
+      <main className="relative flex-1">
+        {/* ============ idle ============ */}
+        {stage.kind === "idle" && (
+          <div className="flex h-full flex-col items-center justify-center gap-8 overflow-y-auto px-6 py-8 text-center">
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              className={`flex w-full max-w-2xl cursor-pointer flex-col items-center gap-6 rounded-2xl border-2 border-dashed px-8 py-14 transition-colors ${
+                dragOver ? "border-cyan-400 bg-cyan-400/5" : "border-white/15 bg-white/[0.02]"
+              }`}
+            >
+              <span className="flex h-16 w-16 items-center justify-center rounded-2xl border border-cyan-400/30 bg-cyan-400/10">
+                <Mountain className="h-8 w-8 text-cyan-300" strokeWidth={1.5} />
+              </span>
+              <div>
+                <h1 className="font-display text-3xl font-semibold tracking-tight sm:text-4xl">
+                  View your site scan
+                </h1>
+                <p className="mx-auto mt-3 max-w-md text-base leading-relaxed text-slate-300">
+                  Press the big button below and pick the scan file we sent you
+                  <span className="pointer-coarse:hidden"> — or drag the file anywhere onto this page</span>.
+                </p>
+              </div>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  fileInputRef.current?.click();
+                }}
+                className="inline-flex items-center gap-3 rounded-xl bg-amber-400 px-10 py-5 font-mono text-[15px] font-semibold uppercase tracking-hud-tight text-[#231603] shadow-[0_0_32px_rgba(251,191,36,0.35)] transition-all hover:bg-amber-300 hover:shadow-[0_0_48px_rgba(251,191,36,0.5)]"
+              >
+                <FolderOpen className="h-5 w-5" />
+                Choose your file
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".las,.laz"
+                className="hidden"
+                tabIndex={-1}
+                aria-hidden="true"
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => {
+                  openFile(e.target.files?.[0]);
+                  e.target.value = "";
+                }}
+              />
+              <p className="text-sm text-slate-400">Works with .las and .laz files</p>
+            </div>
+
+            <div className="flex flex-col items-center gap-3">
+              <button
+                onClick={openDemo}
+                className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-cyan-400/30 px-6 py-3 text-sm text-slate-200 transition-colors hover:border-cyan-400/60 hover:text-cyan-300"
+              >
+                <Sparkles className="h-4 w-4 text-cyan-300" />
+                No file yet? Try the demo scan
+              </button>
+              <p className="max-w-md text-sm text-slate-400">
+                Your file never leaves your computer — it opens right here in
+                your browser. Nothing is uploaded, nothing to install.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* ============ loading ============ */}
+        {stage.kind === "loading" && (
+          <div className="flex h-full flex-col items-center justify-center gap-6 px-6">
+            <p className="font-display text-2xl font-semibold">{stage.phase}</p>
+            <div
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={stage.percent == null ? undefined : Math.round(stage.percent)}
+              aria-label={stage.phase}
+              className="h-3 w-full max-w-md overflow-hidden rounded-full border border-white/10 bg-white/5"
+            >
+              {stage.percent == null ? (
+                <div className="h-full w-1/3 animate-pulse rounded-full bg-cyan-400" />
+              ) : (
+                <div
+                  className="h-full rounded-full bg-cyan-400 transition-[width] duration-200"
+                  style={{ width: `${Math.max(3, Math.round(stage.percent))}%` }}
+                />
+              )}
+            </div>
+            <p className="font-mono text-sm text-slate-400 tabular-nums">
+              {stage.percent == null
+                ? stage.receivedBytes > 1048576
+                  ? `${Math.round(stage.receivedBytes / 1048576)} MB downloaded…`
+                  : "Starting…"
+                : `${Math.round(stage.percent)}%`}
+            </p>
+            {slow && <p className="text-sm text-slate-400">Still working — big scans can take a minute.</p>}
+            <button
+              onClick={reset}
+              className="min-h-11 rounded-xl border border-white/15 px-8 py-3 text-sm text-slate-300 transition-colors hover:border-cyan-400/50 hover:text-cyan-300"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+
+        {/* ============ error ============ */}
+        {stage.kind === "error" && (
+          <div className="flex h-full flex-col items-center justify-center gap-7 px-6 text-center">
+            <p role="alert" className="max-w-md text-lg leading-relaxed text-slate-200">
+              {stage.message}
+            </p>
+            <button
+              ref={errorBtnRef}
+              onClick={() => (stage.retrySrc ? openUrl(stage.retrySrc) : reset())}
+              className="rounded-xl bg-amber-400 px-9 py-4 font-mono text-[14px] font-semibold uppercase tracking-hud-tight text-[#231603] transition-colors hover:bg-amber-300"
+            >
+              {stage.retrySrc ? "Try downloading again" : "Try again"}
+            </button>
+            {stage.retrySrc && (
+              <button
+                onClick={reset}
+                className="min-h-11 rounded-lg border border-white/15 px-6 py-3 text-sm text-slate-300 transition-colors hover:border-cyan-400/50 hover:text-cyan-300"
+              >
+                Choose a file instead
+              </button>
+            )}
+            <p className="text-sm text-slate-400">
+              Still stuck? Email us at{" "}
+              <a
+                href="mailto:ops@aerodata.io"
+                className="text-slate-200 underline decoration-cyan-400/50 underline-offset-4"
+              >
+                ops@aerodata.io
+              </a>{" "}
+              and we'll walk you through it.
+            </p>
+          </div>
+        )}
+
+        {/* ============ ready: the 3D view ============ */}
+        {stage.kind === "ready" && (
+          <>
+            <div
+              ref={mountRef}
+              role="application"
+              aria-label="3D view of your scan"
+              aria-describedby="viewer-kbd-hint"
+              tabIndex={0}
+              onKeyDown={onViewerKeyDown}
+              className="absolute inset-0 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cyan-400/70"
+            />
+            <p id="viewer-kbd-hint" className="sr-only">
+              Arrow keys spin the scan. Plus and minus zoom. R resets the view, T shows the top view.
+            </p>
+
+            {/* legends */}
+            {colorMode === "elevation" && (
+              <div className="pointer-events-none absolute right-4 top-4 flex items-center gap-2.5 rounded-lg border border-white/10 bg-[#030609]/85 px-3.5 py-2.5">
+                <span className="text-sm text-slate-300">Low</span>
+                <span className="h-2.5 w-28 rounded-full bg-[linear-gradient(to_right,#0000ff,#00ffff,#00ff00,#ffff00,#ff0000)]" />
+                <span className="text-sm text-slate-300">High</span>
+              </div>
+            )}
+            {colorMode === "intensity" && (
+              <div className="pointer-events-none absolute right-4 top-4 flex items-center gap-2.5 rounded-lg border border-white/10 bg-[#030609]/85 px-3.5 py-2.5">
+                <span className="text-sm text-slate-300">Dark</span>
+                <span className="h-2.5 w-28 rounded-full bg-gradient-to-r from-slate-900 to-cyan-100" />
+                <span className="text-sm text-slate-300">Bright</span>
+              </div>
+            )}
+            {colorMode === "classification" && (
+              <div className="pointer-events-none absolute right-4 top-4 flex flex-col gap-1.5 rounded-lg border border-white/10 bg-[#030609]/85 px-3.5 py-3">
+                {CLASS_LEGEND.map((c) => (
+                  <span key={c.key} className="flex items-center gap-2.5 text-sm text-slate-300">
+                    <span
+                      className="h-3.5 w-3.5 rounded-sm"
+                      style={{ backgroundColor: `rgb(${c.color[0]},${c.color[1]},${c.color[2]})` }}
+                    />
+                    {c.label}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* unavailable-mode notice */}
+            {modeNotice && (
+              <p
+                role="status"
+                className="absolute bottom-24 left-1/2 -translate-x-1/2 rounded-lg border border-white/15 bg-[#030609]/90 px-4 py-2.5 text-sm text-slate-200"
+              >
+                {modeNotice}
+              </p>
+            )}
+
+            {/* toolbar */}
+            <div className="absolute inset-x-0 bottom-0 flex flex-wrap items-center justify-center gap-2 border-t border-white/10 bg-[#030609]/90 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))] sm:gap-3">
+              <div
+                className="flex flex-wrap items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] p-1.5"
+                role="group"
+                aria-label="Color the scan by"
+              >
+                {COLOR_MODES.map((m) => {
+                  const disabled =
+                    (m.id === "rgb" && !stage.hasRgb) || (m.id === "intensity" && !stage.hasIntensity);
+                  return (
+                    <button
+                      key={m.id}
+                      aria-disabled={disabled || undefined}
+                      aria-pressed={colorMode === m.id}
+                      aria-describedby={disabled ? `${m.id}-na` : undefined}
+                      onClick={() => changeColorMode(m.id, disabled, m.label)}
+                      className={`min-h-11 rounded-lg px-4 py-2 text-sm transition-colors ${
+                        colorMode === m.id
+                          ? "bg-cyan-400/20 text-cyan-200 ring-1 ring-inset ring-cyan-400"
+                          : disabled
+                            ? "cursor-not-allowed text-slate-500"
+                            : "text-slate-300 hover:bg-white/5 hover:text-white"
+                      }`}
+                    >
+                      {m.label}
+                      {disabled && (
+                        <span id={`${m.id}-na`} className="block text-[11px] text-slate-500">
+                          Not in this scan
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div
+                className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] p-1.5"
+                role="group"
+                aria-label="Zoom"
+              >
+                <button onClick={() => sceneRef.current?.zoomBy(1 / 1.4)} className={toolbarBtn}>
+                  <ZoomIn className="h-4 w-4" /> Zoom in
+                </button>
+                <button onClick={() => sceneRef.current?.zoomBy(1.4)} className={toolbarBtn}>
+                  <ZoomOut className="h-4 w-4" /> Zoom out
+                </button>
+              </div>
+
+              <div
+                className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] p-1.5"
+                role="group"
+                aria-label="Camera view"
+              >
+                <button onClick={() => sceneRef.current?.topView()} className={toolbarBtn}>
+                  <Map className="h-4 w-4" /> Top view
+                </button>
+                <button onClick={() => sceneRef.current?.fit()} className={toolbarBtn}>
+                  <RotateCcw className="h-4 w-4" /> Reset view
+                </button>
+              </div>
+
+              <div
+                className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] p-1.5"
+                role="group"
+                aria-label="Dot size"
+              >
+                <button
+                  onClick={() => changePointSize(-1)}
+                  aria-label="Smaller dots"
+                  className="flex h-11 w-11 items-center justify-center rounded-lg text-slate-300 transition-colors hover:bg-white/5 hover:text-white"
+                >
+                  <Minus className="h-5 w-5" />
+                </button>
+                <span className="min-w-[84px] text-center text-sm text-slate-400">Dot size {pointSize}</span>
+                <button
+                  onClick={() => changePointSize(1)}
+                  aria-label="Bigger dots"
+                  className="flex h-11 w-11 items-center justify-center rounded-lg text-slate-300 transition-colors hover:bg-white/5 hover:text-white"
+                >
+                  <Plus className="h-5 w-5" />
+                </button>
+              </div>
+
+              <button
+                ref={helpButtonRef}
+                onClick={() => setHelpOpen(true)}
+                className="flex min-h-11 items-center gap-2 rounded-xl border border-cyan-400/30 px-4 py-2 text-sm text-cyan-300 transition-colors hover:border-cyan-400/60"
+              >
+                <HelpCircle className="h-4 w-4" /> Help
+              </button>
+            </div>
+          </>
+        )}
+
+        {/* drag overlay */}
+        {dragOver && (
+          <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center border-4 border-dashed border-cyan-400 bg-[#030609]/80">
+            <p className="font-display text-3xl font-semibold text-cyan-300">Drop the file to open it</p>
+          </div>
+        )}
+
+        {/* help overlay */}
+        {helpOpen && (
+          <div
+            className="absolute inset-0 z-50 flex items-center justify-center bg-[#030609]/90 p-6"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="help-title"
+            onClick={(e) => {
+              if (e.target === e.currentTarget) setHelpOpen(false);
+            }}
+          >
+            <div id="help-dialog" className="w-full max-w-md rounded-2xl border border-white/15 bg-[#0A121C] p-8">
+              <div className="flex items-start justify-between">
+                <h2 id="help-title" className="font-display text-2xl font-semibold">
+                  How to move around
+                </h2>
+                <button
+                  onClick={() => setHelpOpen(false)}
+                  aria-label="Close help"
+                  className="flex h-11 w-11 items-center justify-center rounded-lg border border-white/10 text-slate-300 hover:text-white"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <ul className="mt-6 space-y-4 text-[15px] leading-relaxed text-slate-300">
+                <li>
+                  <strong className="text-white">Spin the scan:</strong> hold the left mouse button and drag.
+                  On a phone, drag with one finger.
+                </li>
+                <li>
+                  <strong className="text-white">Zoom in and out:</strong> press the Zoom buttons, roll the
+                  mouse wheel, or pinch with two fingers.
+                </li>
+                <li>
+                  <strong className="text-white">Slide around:</strong> hold the right mouse button and drag.
+                  On a phone, drag with two fingers.
+                </li>
+                <li>
+                  <strong className="text-white">Lost?</strong> Press{" "}
+                  <strong className="text-cyan-300">Reset view</strong> and the scan comes right back.
+                </li>
+                <li>
+                  <strong className="text-white">Why "fast preview"?</strong> Very large scans are lightly
+                  thinned so they open quickly in your browser. Your actual scan file is complete and
+                  untouched.
+                </li>
+              </ul>
+              <button
+                ref={gotItRef}
+                onClick={() => setHelpOpen(false)}
+                className="mt-8 w-full rounded-xl bg-amber-400 px-6 py-4 font-mono text-[14px] font-semibold uppercase tracking-hud-tight text-[#231603] transition-colors hover:bg-amber-300"
+              >
+                Got it
+              </button>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}

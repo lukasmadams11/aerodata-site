@@ -96,6 +96,13 @@ html {
   scroll-padding-top: 5rem;
 }
 
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--color-cyan-300);
+    outline-offset: 2px;
+  }
+}
+
 body {
   @apply bg-[#030609] text-slate-100 antialiased;
 }

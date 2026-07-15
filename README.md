@@ -4,6 +4,13 @@ Marketing site for a commercial drone services business: **LiDAR mapping, multis
 
 Single-page React app with a "mission control instrument" aesthetic — a live LiDAR terrain-scan hero canvas, crosshair coordinate cursor, live telemetry readouts, sensor cards with STANDBY → ACQUIRING states, and a GIS-style data-products file inspector.
 
+Includes a **Client Scan Viewer** (`viewer.html`): clients open the `.las`/`.laz`
+files we deliver right in their browser — drag & drop or one big button, fully
+client-side (nothing uploaded, nothing to install). LAS is parsed directly;
+LAZ is decompressed with the laz-perf WebAssembly build in a worker; rendering
+is three.js. Big files are automatically thinned to a device-appropriate point
+budget. Supports `viewer.html?src=<url>` for hosted scans (the host needs CORS).
+
 ## Stack
 
 - [Vite](https://vitejs.dev/) + [React 19](https://react.dev/)
@@ -22,9 +29,11 @@ npm run preview  # serve the production build
 
 ## Where things live
 
-- `src/App.jsx` — the entire site (all sections, canvas engines, and copy)
+- `src/App.jsx` — the entire marketing site (all sections, canvas engines, and copy)
+- `src/viewer/` — the client scan viewer (`ViewerApp.jsx` UI, `las-worker.js` LAS/LAZ parsing, `PointCloudScene.js` three.js renderer)
 - `src/index.css` — design tokens (fonts, tracking scale, keyframes)
-- `index.html` — meta tags, fonts
+- `index.html` / `viewer.html` — the two pages
+- `scripts/gen-test-las.mjs` — generates `public/test.las` (gitignored) for local viewer testing
 
 ## Placeholders to replace before launch
 

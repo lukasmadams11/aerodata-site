@@ -3,5 +3,7 @@ dist/
 .claude/
 _archive/
 *.log
+public/*.las
+public/*.laz
 .DS_Store
 Thumbs.db

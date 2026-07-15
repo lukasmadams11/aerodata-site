@@ -184,6 +184,7 @@ const NAV_LINKS = [
   { label: "Mission", href: "#mission" },
   { label: "Data", href: "#data" },
   { label: "Sectors", href: "#sectors" },
+  { label: "Viewer", href: "viewer.html" },
   { label: "Contact", href: "#contact" },
 ];
 
@@ -1689,6 +1690,17 @@ function DataProducts() {
               </p>
             </div>
           </div>
+
+          <p className="mt-6 text-sm text-slate-400">
+            Already holding a scan from us?{" "}
+            <a
+              href="viewer.html"
+              className="text-slate-200 underline decoration-cyan-400/50 underline-offset-4 transition-colors hover:text-cyan-300"
+            >
+              Open your .las / .laz file in the free Scan Viewer
+            </a>{" "}
+            — right in your browser, nothing to install.
+          </p>
         </Reveal>
       </div>
     </section>
@@ -1970,6 +1982,7 @@ function Footer() {
               <li><a href="#sensors" className="transition-colors hover:text-cyan-300">Sensor suite</a></li>
               <li><a href="#data" className="transition-colors hover:text-cyan-300">Data products</a></li>
               <li><a href="#results" className="transition-colors hover:text-cyan-300">Field results</a></li>
+              <li><a href="viewer.html" className="transition-colors hover:text-cyan-300">Client scan viewer</a></li>
             </ul>
           </div>
           <div>
