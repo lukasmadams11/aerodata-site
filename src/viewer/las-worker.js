@@ -1,16 +1,17 @@
 /*
  * las-worker.js — reads LAS / LAZ point clouds off the main thread.
  *
- * Input:  { type: "parse", file: Blob, budget: number }
+ * Input:  { type: "parse", files: Blob[], budget: number }
  *         { type: "demo", budget: number }
  * Output: { type: "progress", percent, phase }
  *         { type: "done", positions, rgb?, intensity?, classification, ... }
  *         { type: "error", message }
  *
- * The Blob is read in chunks (never fully materialized on the main thread),
- * points are decimated to `budget` by stride sampling, and positions are
- * re-centered on a robust (median-sampled) center so Float32 precision
- * survives state-plane-sized coordinates even when junk points exist.
+ * Multiple files (tiled deliverables) are merged into one cloud: the point
+ * budget is split across files by point count, every tile shares one robust
+ * center (so Float32 precision survives state-plane coordinates), and files
+ * that fail to parse are skipped rather than failing the whole batch.
+ * Blobs are read in chunks — never fully materialized on the main thread.
  */
 
 import { createLazPerf } from "laz-perf";
@@ -25,13 +26,8 @@ self.onmessage = async (e) => {
     if (msg.type === "demo") {
       finish(makeDemo(Math.min(msg.budget || 1200000, 1400000)));
     } else if (msg.type === "parse") {
-      const file = msg.file;
-      const head = await file.slice(0, 375).arrayBuffer();
-      const header = parseHeader(head, file.size);
-      const result = header.compressed
-        ? await parseLaz(file, header, msg.budget)
-        : await parseLas(file, header, msg.budget);
-      finish(result);
+      const files = msg.files || (msg.file ? [msg.file] : []);
+      finish(await parseBatch(files, msg.budget));
     }
   } catch (err) {
     self.postMessage({ type: "error", message: friendly(err) });
@@ -51,12 +47,12 @@ function finish(r) {
 
 function friendly(err) {
   if (err && err.message === "NOT_LAS")
-    return "That file doesn't look like a LAS or LAZ scan. Please choose the .las or .laz file we sent you.";
+    return "Those files don't look like LAS or LAZ scans. Look for files ending in .las or .laz — they're often inside a folder named something like \"terra_las\" or \"lidars\".";
   if (err && err.message === "EMPTY")
-    return "This file doesn't contain any points we can read.";
+    return "These files don't contain any points we can read.";
   if (err && err.message === "TOO_BIG")
     return "This scan is too big for this device to open. Try a computer with more memory, or contact us and we'll send a lighter version.";
-  return "Something went wrong while reading this file. If it keeps happening, contact us and we'll help.";
+  return "Something went wrong while reading these files. If it keeps happening, contact us and we'll help.";
 }
 
 /* ---------------- LAS public header ---------------- */
@@ -95,10 +91,16 @@ function parseHeader(headBuffer, fileSize) {
 /* RGB byte offset inside a point record, by format (null = no color) */
 const RGB_OFFSET = { 0: null, 1: null, 2: 20, 3: 28, 4: null, 5: 28, 6: null, 7: 30, 8: 30, 9: null, 10: 30 };
 
+const fileHasRgb = (h) => {
+  const off = RGB_OFFSET[h.format] ?? null;
+  return off !== null && h.recordLength >= off + 6;
+};
+
 /* ---------------- collection ---------------- */
 
 function makeCollector(kept, hasRgb, center = null) {
   return {
+    capacity: kept,
     positions: new Float32Array(kept * 3),
     rgb16: hasRgb ? new Uint16Array(kept * 3) : null,
     intensity16: new Uint16Array(kept),
@@ -111,6 +113,7 @@ function makeCollector(kept, hasRgb, center = null) {
 }
 
 function collect(c, x, y, z, intensity, cls, r, g, b) {
+  if (c.n >= c.capacity) return; /* LAZ headers can under-report; never overflow */
   if (!c.center) c.center = [Math.floor(x), Math.floor(y), Math.floor(z)];
   const i3 = c.n * 3;
   c.positions[i3] = x - c.center[0];
@@ -136,8 +139,7 @@ const median = (arr) => {
 };
 
 /* Robust display bounds: percentile-based so a handful of junk points
-   (a "point at origin" 500 km from the site) can't wreck the camera fit,
-   the grid, or the elevation ramp. */
+   can't wreck the camera fit, the grid, or the elevation ramp. */
 function robustBounds(c) {
   const n = c.n;
   const step = Math.max(1, Math.floor(n / 100000));
@@ -207,40 +209,99 @@ function readRecord(dv, base, h, rgbOff, clsOff, clsMask, c) {
   collect(c, x, y, z, intensity, cls, r, g, b);
 }
 
+/* ---------------- batch orchestration ---------------- */
+
+async function parseBatch(files, budget) {
+  if (!files.length) throw new Error("NOT_LAS");
+
+  /* pass 1: headers — establish counts so the budget splits fairly */
+  const metas = [];
+  let skipped = 0;
+  let totalPoints = 0;
+  for (const file of files) {
+    try {
+      const head = await file.slice(0, 375).arrayBuffer();
+      const h = parseHeader(head, file.size);
+      const usable = h.compressed
+        ? h.count
+        : Math.max(0, Math.min(h.count, Math.floor((file.size - h.offsetToPoints) / h.recordLength)));
+      if (!usable) throw new Error("EMPTY");
+      metas.push({ file, h, usable });
+      totalPoints += usable;
+    } catch {
+      skipped++;
+    }
+  }
+  if (!metas.length) throw new Error("NOT_LAS");
+
+  /* pass 2: split the budget by point count; size one shared collector */
+  let totalKept = 0;
+  for (const m of metas) {
+    const share = Math.max(1, Math.round(budget * (m.usable / totalPoints)));
+    m.stride = Math.max(1, Math.ceil(m.usable / share));
+    m.kept = Math.floor((m.usable - 1) / m.stride) + 1;
+    totalKept += m.kept;
+  }
+  const anyRgb = metas.some((m) => fileHasRgb(m.h));
+  const c = makeCollector(totalKept, anyRgb);
+
+  /* pass 3: parse every tile into the shared collector */
+  const many = metas.length > 1;
+  let donePoints = 0;
+  for (let fi = 0; fi < metas.length; fi++) {
+    const m = metas[fi];
+    const label = many
+      ? `Reading file ${fi + 1} of ${metas.length}…`
+      : m.h.compressed
+        ? "Uncompressing…"
+        : "Reading your scan…";
+    const report = (frac) => progress(((donePoints + frac * m.usable) / totalPoints) * 100, label);
+    try {
+      if (m.h.compressed) await parseLazInto(c, m, report);
+      else await parseLasInto(c, m, report);
+    } catch (err) {
+      if (err && err.message === "TOO_BIG" && !many) throw err;
+      skipped++;
+    }
+    donePoints += m.usable;
+  }
+
+  if (c.n === 0) throw new Error("EMPTY");
+  const result = packResult(c, metas[0].h.format, totalPoints);
+  result.fileCount = metas.length;
+  result.skipped = skipped;
+  return result;
+}
+
 /* ---------------- uncompressed LAS (chunked reads) ---------------- */
 
-async function parseLas(file, h, budget) {
-  const usable = Math.max(
-    0,
-    Math.min(h.count, Math.floor((file.size - h.offsetToPoints) / h.recordLength))
-  );
-  if (usable === 0) throw new Error("EMPTY");
-
-  const stride = Math.max(1, Math.ceil(usable / budget));
-  const kept = Math.floor((usable - 1) / stride) + 1;
+async function parseLasInto(c, m, report) {
+  const { file, h, stride, usable } = m;
   const rgbOff = RGB_OFFSET[h.format] ?? null;
   const hasRgb = rgbOff !== null && h.recordLength >= rgbOff + 6;
   const effRgbOff = hasRgb ? rgbOff : null;
   const clsOff = h.format <= 5 ? 15 : 16;
   const clsMask = h.format <= 5 ? 0x1f : 0xff;
 
-  /* robust center: median of up to 256 records spread across the file */
-  const sampleN = Math.min(256, usable);
-  const sampleStride = Math.max(1, Math.floor(usable / sampleN));
-  const sx = [], sy = [], sz = [];
-  for (let k = 0; k < sampleN; k++) {
-    const base = h.offsetToPoints + k * sampleStride * h.recordLength;
-    const dv = new DataView(await file.slice(base, base + 12).arrayBuffer());
-    if (dv.byteLength < 12) break;
-    sx.push(dv.getInt32(0, true) * h.scale[0] + h.offset[0]);
-    sy.push(dv.getInt32(4, true) * h.scale[1] + h.offset[1]);
-    sz.push(dv.getInt32(8, true) * h.scale[2] + h.offset[2]);
+  /* robust shared center: median of up to 256 records spread across the
+     first file that gets here */
+  if (!c.center) {
+    const sampleN = Math.min(256, usable);
+    const sampleStride = Math.max(1, Math.floor(usable / sampleN));
+    const sx = [], sy = [], sz = [];
+    for (let k = 0; k < sampleN; k++) {
+      const base = h.offsetToPoints + k * sampleStride * h.recordLength;
+      const dv = new DataView(await file.slice(base, base + 12).arrayBuffer());
+      if (dv.byteLength < 12) break;
+      sx.push(dv.getInt32(0, true) * h.scale[0] + h.offset[0]);
+      sy.push(dv.getInt32(4, true) * h.scale[1] + h.offset[1]);
+      sz.push(dv.getInt32(8, true) * h.scale[2] + h.offset[2]);
+    }
+    if (sx.length) {
+      c.center = [Math.floor(median(sx)), Math.floor(median(sy)), Math.floor(median(sz))];
+    }
   }
-  const center = sx.length
-    ? [Math.floor(median(sx)), Math.floor(median(sy)), Math.floor(median(sz))]
-    : null;
 
-  const c = makeCollector(kept, hasRgb, center);
   const blockRecords = Math.max(1, Math.floor(CHUNK / h.recordLength));
   let nextSample = 0;
 
@@ -255,10 +316,8 @@ async function parseLas(file, h, budget) {
       readRecord(dv, (nextSample - start) * h.recordLength, h, effRgbOff, clsOff, clsMask, c);
       nextSample += stride;
     }
-    progress((start / usable) * 100, "Reading your scan…");
+    report(start / usable);
   }
-
-  return packResult(c, h.format, usable);
 }
 
 /* ---------------- LAZ via laz-perf WASM ---------------- */
@@ -269,8 +328,9 @@ function getLazPerf() {
   return lazPerfPromise;
 }
 
-async function parseLaz(file, h, budget) {
-  progress(0, "Uncompressing…");
+async function parseLazInto(c, m, report) {
+  const { file, h, stride } = m;
+  report(0);
   const LazPerf = await getLazPerf();
 
   let filePtr = 0;
@@ -288,27 +348,23 @@ async function parseLaz(file, h, budget) {
 
     laszip = new LazPerf.LASZip();
     laszip.open(filePtr, file.size);
-    const total = laszip.getCount() || h.count;
-    if (total === 0) throw new Error("EMPTY");
+    const total = laszip.getCount() || m.usable;
     const recordLength = laszip.getPointLength();
     const format = laszip.getPointFormat() & 0x3f;
     dataPtr = LazPerf._malloc(recordLength);
     if (!dataPtr) throw new Error("TOO_BIG");
 
-    const stride = Math.max(1, Math.ceil(total / budget));
-    const kept = Math.floor((total - 1) / stride) + 1;
     const rgbOff = RGB_OFFSET[format] ?? null;
     const hasRgb = rgbOff !== null && recordLength >= rgbOff + 6;
     const effRgbOff = hasRgb ? rgbOff : null;
     const clsOff = format <= 5 ? 15 : 16;
     const clsMask = format <= 5 ? 0x1f : 0xff;
-    const c = makeCollector(kept, hasRgb);
 
-    /* robust center: median of the first sampled records (decode is sequential,
-       so a spread sample isn't available — a local median still defeats junk
-       points and gives Float32 all the precision it needs) */
-    const PRESCAN = Math.min(256, kept);
-    const pre = [];
+    /* Robust shared center: if none exists yet, buffer the first sampled
+       records, take the median, then flush. `pre` is nulled after the one
+       flush so the buffer can never re-trigger and shift the center. */
+    const PRESCAN = 256;
+    let pre = c.center ? null : [];
 
     /* the wasm heap can grow and detach earlier views — re-check per point */
     let heapBuf = LazPerf.HEAPU8.buffer;
@@ -322,8 +378,7 @@ async function parseLaz(file, h, budget) {
         heapBuf = LazPerf.HEAPU8.buffer;
         dv = new DataView(heapBuf);
       }
-      if (pre !== null && pre.length < PRESCAN) {
-        /* buffer decoded fields until the center is established */
+      if (pre) {
         const x = dv.getInt32(dataPtr, true) * h.scale[0] + h.offset[0];
         const y = dv.getInt32(dataPtr + 4, true) * h.scale[1] + h.offset[1];
         const z = dv.getInt32(dataPtr + 8, true) * h.scale[2] + h.offset[2];
@@ -336,16 +391,17 @@ async function parseLaz(file, h, budget) {
           b = dv.getUint16(dataPtr + effRgbOff + 4, true);
         }
         pre.push([x, y, z, intensity, cls, r, g, b]);
-        if (pre.length === PRESCAN) flushPrescan(c, pre);
+        if (pre.length === PRESCAN) {
+          flushPrescan(c, pre);
+          pre = null;
+        }
         continue;
       }
       readRecord(dv, dataPtr, hdr, effRgbOff, clsOff, clsMask, c);
-      if (i % PROGRESS_EVERY === 0) progress((i / total) * 100, "Uncompressing…");
+      if (i % PROGRESS_EVERY === 0) report(i / total);
     }
-    /* small files: prescan may never have filled */
-    if (c.n === 0 && pre.length) flushPrescan(c, pre);
-
-    return packResult(c, format, total);
+    /* small files: the prescan buffer may never have filled */
+    if (pre && pre.length) flushPrescan(c, pre);
   } finally {
     if (dataPtr) LazPerf._free(dataPtr);
     if (filePtr) LazPerf._free(filePtr);
@@ -354,11 +410,13 @@ async function parseLaz(file, h, budget) {
 }
 
 function flushPrescan(c, pre) {
-  c.center = [
-    Math.floor(median(pre.map((p) => p[0]))),
-    Math.floor(median(pre.map((p) => p[1]))),
-    Math.floor(median(pre.map((p) => p[2]))),
-  ];
+  if (!c.center) {
+    c.center = [
+      Math.floor(median(pre.map((p) => p[0]))),
+      Math.floor(median(pre.map((p) => p[1]))),
+      Math.floor(median(pre.map((p) => p[2]))),
+    ];
+  }
   for (const p of pre) collect(c, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
   pre.length = 0;
 }
@@ -432,5 +490,8 @@ function makeDemo(n) {
     if (iy % 40 === 0) progress((iy / rows) * 100, "Building the demo scan…");
   }
 
-  return packResult(c, 3, kept);
+  const result = packResult(c, 3, kept);
+  result.fileCount = 1;
+  result.skipped = 0;
+  return result;
 }

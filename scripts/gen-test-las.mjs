@@ -1,12 +1,18 @@
-/* Generates public/test.las — a synthetic LAS 1.2 / point-format-3 terrain
-   for end-to-end viewer testing. Not committed (gitignored). */
+/* Generates public/test.las and public/test2.las — synthetic LAS 1.2 /
+   point-format-3 terrain tiles (adjacent, like a tiled deliverable) for
+   end-to-end viewer testing. Not committed (gitignored). */
 import { writeFileSync, mkdirSync } from "node:fs";
 
 const N = 300000;
 const HEADER = 227;
 const REC = 34;
 
-const buf = Buffer.alloc(HEADER + N * REC);
+genTile("test.las", 512000, 1234);
+genTile("test2.las", 512282, 5678); /* adjacent tile, +282 m east */
+
+function genTile(name, originX, seed) {
+
+  const buf = Buffer.alloc(HEADER + N * REC);
 
 /* ---- header ---- */
 buf.write("LASF", 0, "ascii");
@@ -24,7 +30,7 @@ buf.writeUInt16LE(REC, 105);
 buf.writeUInt32LE(N, 107);
 
 const scale = 0.01;
-const ox = 512000, oy = 4182000, oz = 100;
+  const ox = originX, oy = 4182000, oz = 100;
 buf.writeDoubleLE(scale, 131);
 buf.writeDoubleLE(scale, 139);
 buf.writeDoubleLE(scale, 147);
@@ -33,7 +39,7 @@ buf.writeDoubleLE(oy, 163);
 buf.writeDoubleLE(oz, 171);
 
 /* ---- points: rolling terrain + one flat "building" pad ---- */
-let s = 1234;
+  let s = seed;
 const rnd = () => (s = (s * 16807) % 2147483647) / 2147483647;
 const W = 280, D = 200;
 const cols = Math.round(Math.sqrt((N * W) / D));
@@ -97,6 +103,7 @@ buf.writeDoubleLE(minY, 203);
 buf.writeDoubleLE(maxZ, 211);
 buf.writeDoubleLE(minZ, 219);
 
-mkdirSync(new URL("../public/", import.meta.url), { recursive: true });
-writeFileSync(new URL("../public/test.las", import.meta.url), buf);
-console.log(`Wrote public/test.las — ${written} points, ${(buf.length / 1e6).toFixed(1)} MB`);
+  mkdirSync(new URL("../public/", import.meta.url), { recursive: true });
+  writeFileSync(new URL(`../public/${name}`, import.meta.url), buf);
+  console.log(`Wrote public/${name} — ${written} points, ${(buf.length / 1e6).toFixed(1)} MB`);
+}

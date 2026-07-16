@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   Crosshair,
+  Files,
   FolderOpen,
   HelpCircle,
   Map,
@@ -87,6 +88,8 @@ export default function ViewerApp() {
   const sceneRef = useRef(null);
   const mountRef = useRef(null);
   const fileInputRef = useRef(null);
+  const folderInputRef = useRef(null);
+  const pendingSkipRef = useRef(0);
   const loadGenRef = useRef(0);
   const abortRef = useRef(null);
   const helpButtonRef = useRef(null);
@@ -122,13 +125,24 @@ export default function ViewerApp() {
         dataRef.current = msg;
         setColorMode(msg.rgb ? "rgb" : "elevation");
         setPointSize(2);
+        const skipped = (msg.skipped || 0) + pendingSkipRef.current;
+        pendingSkipRef.current = 0;
         setStage({
           kind: "ready",
           kept: msg.kept,
           total: msg.total,
           hasRgb: !!msg.rgb,
           hasIntensity: msg.hasIntensity,
+          fileCount: msg.fileCount || 1,
         });
+        if (skipped > 0) {
+          showNotice(
+            skipped === 1
+              ? "1 file couldn't be opened and was skipped."
+              : `${skipped} files couldn't be opened and were skipped.`,
+            7000
+          );
+        }
       } else if (msg.type === "error") {
         worker.terminate();
         workerRef.current = null;
@@ -148,21 +162,31 @@ export default function ViewerApp() {
     return worker;
   };
 
-  const openFile = (file) => {
-    if (!file) return;
+  const openFiles = (list) => {
+    const all = Array.from(list || []).filter(Boolean);
+    if (!all.length) return;
     const viewing = sceneRef.current !== null;
-    const isLaz = /\.laz$/i.test(file.name);
-    const isLas = /\.las$/i.test(file.name);
-    if (!isLas && !isLaz) {
+    const scans = all.filter((f) => /\.la[sz]$/i.test(f.name));
+    if (!scans.length) {
       if (viewing) return; /* ignore an accidental mis-drop; keep the current 3D view */
       beginLoad();
       setStage({
         kind: "error",
-        message: `"${file.name}" isn't a scan file. Please choose the file ending in .las or .laz that we sent you.`,
+        message:
+          all.length > 1
+            ? 'None of those files look like scans. Look for files ending in .las or .laz — they\'re often inside a folder named something like "terra_las" or "lidars".'
+            : `"${all[0].name}" isn't a scan file. Please choose the file ending in .las or .laz that we sent you.`,
       });
       return;
     }
-    if ((isLaz && file.size > MAX_LAZ_BYTES) || (isLas && file.size > MAX_LAS_BYTES)) {
+    const usable = [];
+    let tooBig = 0;
+    for (const f of scans) {
+      const cap = /\.laz$/i.test(f.name) ? MAX_LAZ_BYTES : MAX_LAS_BYTES;
+      if (f.size > cap) tooBig++;
+      else usable.push(f);
+    }
+    if (!usable.length) {
       if (viewing) return;
       beginLoad();
       setStage({ kind: "error", message: TOO_LARGE_MSG });
@@ -170,9 +194,14 @@ export default function ViewerApp() {
     }
     beginLoad();
     loadSceneModule();
-    setStage({ kind: "loading", percent: 0, phase: "Opening the file…" });
-    /* Files structured-clone by reference — the worker streams it in chunks */
-    startWorker().postMessage({ type: "parse", file, budget: POINT_BUDGET });
+    pendingSkipRef.current = tooBig;
+    setStage({
+      kind: "loading",
+      percent: 0,
+      phase: usable.length > 1 ? `Opening ${usable.length} files…` : "Opening the file…",
+    });
+    /* Files structured-clone by reference — the worker streams them in chunks */
+    startWorker().postMessage({ type: "parse", files: usable, budget: POINT_BUDGET });
   };
 
   const openDemo = () => {
@@ -242,7 +271,7 @@ export default function ViewerApp() {
         }
       }
       if (isStale(gen)) return;
-      startWorker().postMessage({ type: "parse", file: new Blob(chunks), budget: POINT_BUDGET });
+      startWorker().postMessage({ type: "parse", files: [new Blob(chunks)], budget: POINT_BUDGET });
     } catch {
       if (isStale(gen)) return; /* aborted/superseded — not an error */
       setStage({
@@ -276,6 +305,32 @@ export default function ViewerApp() {
 
   useEffect(() => {
     const isFileDrag = (e) => e.dataTransfer?.types?.includes("Files");
+    const readAll = (reader) =>
+      new Promise((resolve, reject) => {
+        const out = [];
+        const step = () =>
+          reader.readEntries((entries) => {
+            if (!entries.length) return resolve(out);
+            out.push(...entries);
+            step();
+          }, reject);
+        step();
+      });
+    const walk = async (entry, files) => {
+      if (entry.isFile) {
+        try {
+          files.push(await new Promise((res, rej) => entry.file(res, rej)));
+        } catch {
+          /* unreadable entry — skip */
+        }
+      } else if (entry.isDirectory) {
+        try {
+          for (const child of await readAll(entry.createReader())) await walk(child, files);
+        } catch {
+          /* unreadable folder — skip */
+        }
+      }
+    };
     const onDragOver = (e) => {
       if (!isFileDrag(e)) return;
       e.preventDefault();
@@ -284,12 +339,22 @@ export default function ViewerApp() {
     const onDragLeave = (e) => {
       if (!e.relatedTarget) setDragOver(false);
     };
-    const onDrop = (e) => {
+    const onDrop = async (e) => {
       if (!isFileDrag(e)) return;
       e.preventDefault();
       setDragOver(false);
-      const files = Array.from(e.dataTransfer.files || []);
-      openFile(files.find((f) => /\.la[sz]$/i.test(f.name)) || files[0]);
+      /* entries must be captured synchronously, before any await */
+      const entries = Array.from(e.dataTransfer.items || [])
+        .map((item) => item.webkitGetAsEntry?.())
+        .filter(Boolean);
+      const plainFiles = Array.from(e.dataTransfer.files || []);
+      if (!entries.length) {
+        openFiles(plainFiles);
+        return;
+      }
+      const files = [];
+      for (const entry of entries) await walk(entry, files);
+      openFiles(files.length ? files : plainFiles);
     };
     window.addEventListener("dragover", onDragOver);
     window.addEventListener("dragleave", onDragLeave);
@@ -398,10 +463,10 @@ export default function ViewerApp() {
 
   /* ---------------- toolbar handlers ---------------- */
 
-  const showNotice = (text) => {
+  const showNotice = (text, ms = 3500) => {
     setModeNotice(text);
     clearTimeout(noticeTimerRef.current);
-    noticeTimerRef.current = setTimeout(() => setModeNotice(""), 3500);
+    noticeTimerRef.current = setTimeout(() => setModeNotice(""), ms);
   };
   useEffect(() => () => clearTimeout(noticeTimerRef.current), []);
 
@@ -474,16 +539,17 @@ export default function ViewerApp() {
         {stage.kind === "ready" && (
           <div className="flex items-center gap-4">
             <span className="hidden font-mono text-[12px] tracking-hud-tight text-slate-400 md:block">
-              {stage.kept < stage.total
-                ? `Fast preview — ${formatPoints(stage.kept)} points`
-                : `${formatPoints(stage.kept)} points`}
+              {(stage.fileCount > 1 ? `${stage.fileCount} files · ` : "") +
+                (stage.kept < stage.total
+                  ? `Fast preview — ${formatPoints(stage.kept)} points`
+                  : `${formatPoints(stage.kept)} points`)}
             </span>
             <button
               ref={openAnotherRef}
               onClick={reset}
               className="min-h-11 rounded-lg border border-white/15 px-4 py-2 text-sm text-slate-300 transition-colors hover:border-cyan-400/50 hover:text-cyan-300"
             >
-              Open another file
+              Open other files
             </button>
           </div>
         )}
@@ -507,34 +573,66 @@ export default function ViewerApp() {
                   View your site scan
                 </h1>
                 <p className="mx-auto mt-3 max-w-md text-base leading-relaxed text-slate-300">
-                  Press the big button below and pick the scan file we sent you
-                  <span className="pointer-coarse:hidden"> — or drag the file anywhere onto this page</span>.
+                  Press the big button below and pick the scan files we sent
+                  you — you can select several at once
+                  <span className="pointer-coarse:hidden">
+                    , or drag files or whole folders anywhere onto this page
+                  </span>
+                  .
                 </p>
               </div>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  fileInputRef.current?.click();
-                }}
-                className="inline-flex items-center gap-3 rounded-xl bg-amber-400 px-10 py-5 font-mono text-[15px] font-semibold uppercase tracking-hud-tight text-[#231603] shadow-[0_0_32px_rgba(251,191,36,0.35)] transition-all hover:bg-amber-300 hover:shadow-[0_0_48px_rgba(251,191,36,0.5)]"
-              >
-                <FolderOpen className="h-5 w-5" />
-                Choose your file
-              </button>
+              <div className="flex flex-wrap items-center justify-center gap-3">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    fileInputRef.current?.click();
+                  }}
+                  className="inline-flex items-center gap-3 rounded-xl bg-amber-400 px-10 py-5 font-mono text-[15px] font-semibold uppercase tracking-hud-tight text-[#231603] shadow-[0_0_32px_rgba(251,191,36,0.35)] transition-all hover:bg-amber-300 hover:shadow-[0_0_48px_rgba(251,191,36,0.5)]"
+                >
+                  <Files className="h-5 w-5" />
+                  Choose your files
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    folderInputRef.current?.click();
+                  }}
+                  className="inline-flex min-h-11 items-center gap-2 rounded-xl border border-white/15 px-6 py-5 text-sm text-slate-200 transition-colors hover:border-cyan-400/50 hover:text-cyan-300"
+                >
+                  <FolderOpen className="h-4 w-4" />
+                  Choose a whole folder
+                </button>
+              </div>
               <input
                 ref={fileInputRef}
                 type="file"
                 accept=".las,.laz"
+                multiple
                 className="hidden"
                 tabIndex={-1}
                 aria-hidden="true"
                 onClick={(e) => e.stopPropagation()}
                 onChange={(e) => {
-                  openFile(e.target.files?.[0]);
+                  openFiles(e.target.files);
                   e.target.value = "";
                 }}
               />
-              <p className="text-sm text-slate-400">Works with .las and .laz files</p>
+              <input
+                ref={folderInputRef}
+                type="file"
+                webkitdirectory=""
+                className="hidden"
+                tabIndex={-1}
+                aria-hidden="true"
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => {
+                  openFiles(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+              <p className="text-sm text-slate-400">
+                Works with .las and .laz files — tiled scans open together as one map
+              </p>
             </div>
 
             <div className="flex flex-col items-center gap-3">
