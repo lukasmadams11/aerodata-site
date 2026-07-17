@@ -284,6 +284,12 @@ export default function ViewerApp() {
     const splats = all.filter((f) => SPLAT_RE.test(f.name));
     if (!scans.length && splats.length) {
       openSplatOnly(splats[0]);
+      if (splats.length > 1) {
+        showNotice(
+          `This folder has ${splats.length} photo tiles — showing the first one. Full multi-tile photo models are coming soon.`,
+          9000
+        );
+      }
       return;
     }
     if (!scans.length) {
@@ -589,6 +595,20 @@ export default function ViewerApp() {
     if (!safeModeRef.current) {
       safeModeRef.current = true;
       showNotice("Your graphics driver restarted — switching to a lighter display mode…", 6000);
+      /* photo models must be explicitly re-queued for the rebuilt scene —
+         setData covers the scan, but the splat load is a separate step */
+      if (splatUrlRef.current) {
+        splatLoadRunningRef.current = false;
+        setSplatState({ loading: true, percent: 0 });
+      }
+      setSceneNonce((n) => n + 1);
+      return;
+    }
+    if (!dataRef.current && splatUrlRef.current && !retriedLiteRef.current) {
+      /* splat-only and already in safe mode: one more rebuild attempt */
+      retriedLiteRef.current = true;
+      splatLoadRunningRef.current = false;
+      setSplatState({ loading: true, percent: 0 });
       setSceneNonce((n) => n + 1);
       return;
     }
@@ -680,10 +700,7 @@ export default function ViewerApp() {
       )
       .then((count) => {
         if (cancelled) return;
-        if (su.revoke) {
-          URL.revokeObjectURL(su.url);
-          su.revoke = false;
-        }
+        /* keep the object URL alive — a GPU-reset rebuild needs to reload it */
         setSplatState({ count });
         setViewMode("splat");
         setAnnounce("Photo view loaded.");
