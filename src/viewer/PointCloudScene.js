@@ -64,6 +64,9 @@ const EDL_VERT = /* glsl */ `
   }
 `;
 
+/* Strict GLSL ES 1.00 — no loops around texture reads, no array
+   constructors. Some drivers hard-reject those patterns (others merely
+   warn), and a failed compile here would mean a black viewer. */
 const EDL_FRAG = /* glsl */ `
   precision highp float;
   uniform sampler2D tColor;
@@ -79,6 +82,12 @@ const EDL_FRAG = /* glsl */ `
     return (2.0 * uNear * uFar) / (uFar + uNear - z * (uFar - uNear));
   }
 
+  float obscure(vec2 uv, float logC) {
+    float dn = texture2D(tDepth, uv).x;
+    if (dn >= 1.0) return 0.0;
+    return max(0.0, logC - log2(linearDepth(dn)));
+  }
+
   void main() {
     vec4 color = texture2D(tColor, vUv);
     float dRaw = texture2D(tDepth, vUv).x;
@@ -88,17 +97,15 @@ const EDL_FRAG = /* glsl */ `
     }
     float logC = log2(linearDepth(dRaw));
     vec2 px = 1.4 / uResolution;
-    float response = 0.0;
-    const vec2 DIRS[8] = vec2[8](
-      vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0),
-      vec2(0.7, 0.7), vec2(-0.7, 0.7), vec2(0.7, -0.7), vec2(-0.7, -0.7)
-    );
-    for (int i = 0; i < 8; i++) {
-      float dn = texture2D(tDepth, vUv + DIRS[i] * px).x;
-      if (dn < 1.0) {
-        response += max(0.0, logC - log2(linearDepth(dn)));
-      }
-    }
+    float response =
+      obscure(vUv + vec2(px.x, 0.0), logC) +
+      obscure(vUv + vec2(-px.x, 0.0), logC) +
+      obscure(vUv + vec2(0.0, px.y), logC) +
+      obscure(vUv + vec2(0.0, -px.y), logC) +
+      obscure(vUv + vec2(px.x * 0.7, px.y * 0.7), logC) +
+      obscure(vUv + vec2(-px.x * 0.7, px.y * 0.7), logC) +
+      obscure(vUv + vec2(px.x * 0.7, -px.y * 0.7), logC) +
+      obscure(vUv + vec2(-px.x * 0.7, -px.y * 0.7), logC);
     response /= 8.0;
     float shade = clamp(exp(-response * 60.0 * uStrength), 0.25, 1.0);
     gl_FragColor = vec4(color.rgb * shade, color.a);
@@ -117,6 +124,14 @@ export class PointCloudScene {
     this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
     this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     this.renderer.setClearColor("#05090F");
+    /* if ANY shader fails to compile on this GPU, drop the EDL post pass
+       rather than showing a black view */
+    this.renderer.debug.onShaderError = () => {
+      if (this.edlOk) {
+        this.edlOk = false;
+        this.wake?.();
+      }
+    };
     container.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
@@ -211,20 +226,25 @@ export class PointCloudScene {
   renderFrame() {
     /* EDL only benefits the point cloud; splats render direct */
     if (this.edlOk && this.mode === "points" && this.points) {
-      const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
-      if (this.rt.width !== size.x || this.rt.height !== size.y) {
-        this.rt.setSize(size.x, size.y);
-        this.edlMaterial.uniforms.uResolution.value.set(size.x, size.y);
+      try {
+        const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+        if (this.rt.width !== size.x || this.rt.height !== size.y) {
+          this.rt.setSize(size.x, size.y);
+          this.edlMaterial.uniforms.uResolution.value.set(size.x, size.y);
+        }
+        this.edlMaterial.uniforms.uNear.value = this.camera.near;
+        this.edlMaterial.uniforms.uFar.value = this.camera.far;
+        this.renderer.setRenderTarget(this.rt);
+        this.renderer.render(this.scene, this.camera);
+        this.renderer.setRenderTarget(null);
+        this.renderer.render(this.edlScene, this.edlCamera);
+        return;
+      } catch {
+        this.edlOk = false;
+        this.renderer.setRenderTarget(null);
       }
-      this.edlMaterial.uniforms.uNear.value = this.camera.near;
-      this.edlMaterial.uniforms.uFar.value = this.camera.far;
-      this.renderer.setRenderTarget(this.rt);
-      this.renderer.render(this.scene, this.camera);
-      this.renderer.setRenderTarget(null);
-      this.renderer.render(this.edlScene, this.edlCamera);
-    } else {
-      this.renderer.render(this.scene, this.camera);
     }
+    this.renderer.render(this.scene, this.camera);
   }
 
   resize() {
