@@ -35,12 +35,13 @@ const IS_CONSTRAINED = (() => {
   return /Macintosh/i.test(ua) && navigator.maxTouchPoints > 1;
 })();
 
-/* ?budget=N supports testing and power users */
-const URL_BUDGET =
-  typeof window !== "undefined"
-    ? Number(new URLSearchParams(window.location.search).get("budget")) || 0
-    : 0;
+/* ?budget=N and ?safe=1 support testing, troubleshooting, and power users */
+const URL_PARAMS =
+  typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
+const URL_BUDGET = Number(URL_PARAMS.get("budget")) || 0;
 const POINT_BUDGET = URL_BUDGET > 0 ? URL_BUDGET : IS_CONSTRAINED ? 2000000 : 4500000;
+const SAFE_START = URL_PARAMS.get("safe") === "1";
+const LITE_BUDGET = 1200000;
 
 /* Gaussian-splat "photo" models (DJI Terra 3DGS output and friends) */
 const SPLAT_RE = /\.(ply|splat|ksplat|spz)$/i;
@@ -142,6 +143,9 @@ export default function ViewerApp() {
   const sourceRef = useRef(null); /* { files, center } — for Sharpen reloads */
   const sharpenedRef = useRef(false);
   const snapshotRef = useRef(null); /* camera to restore after a sharpen */
+  const safeModeRef = useRef(SAFE_START); /* lighter rendering after a GPU reset */
+  const retriedLiteRef = useRef(false);
+  const [sceneNonce, setSceneNonce] = useState(0);
   const loadGenRef = useRef(0);
   const abortRef = useRef(null);
   const helpButtonRef = useRef(null);
@@ -577,6 +581,38 @@ export default function ViewerApp() {
 
   const [sceneEpoch, setSceneEpoch] = useState(0);
 
+  /* GPU context loss recovery ladder:
+     1st loss → rebuild the same data in a lighter display mode
+     2nd loss → reload the scan at reduced point count
+     after that → honest error with advice */
+  const handleContextLost = () => {
+    if (!safeModeRef.current) {
+      safeModeRef.current = true;
+      showNotice("Your graphics driver restarted — switching to a lighter display mode…", 6000);
+      setSceneNonce((n) => n + 1);
+      return;
+    }
+    if (sourceRef.current && !retriedLiteRef.current) {
+      retriedLiteRef.current = true;
+      sharpenedRef.current = false;
+      snapshotRef.current = null;
+      beginLoad();
+      setStage({ kind: "loading", percent: 0, phase: "Reloading at lighter detail…" });
+      startWorker().postMessage({
+        type: "parse",
+        files: sourceRef.current.files,
+        budget: LITE_BUDGET,
+        center: sourceRef.current.center,
+      });
+      return;
+    }
+    setStage({
+      kind: "error",
+      message:
+        "Your computer's graphics couldn't display this scan. Try closing other programs and tabs, then open the file again — or contact us and we'll send a lighter version.",
+    });
+  };
+
   useEffect(() => {
     if (stage.kind !== "ready" || !mountRef.current) return;
     let cancelled = false;
@@ -584,7 +620,8 @@ export default function ViewerApp() {
     loadSceneModule()
       .then(({ PointCloudScene }) => {
         if (cancelled || !mountRef.current) return;
-        scene = new PointCloudScene(mountRef.current);
+        scene = new PointCloudScene(mountRef.current, { safeMode: safeModeRef.current });
+        scene.onContextLost = handleContextLost;
         if (dataRef.current) {
           const snap = snapshotRef.current;
           scene.setData(dataRef.current, { keepCamera: !!snap });
@@ -618,7 +655,7 @@ export default function ViewerApp() {
       sceneRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stage.kind]);
+  }, [stage.kind, sceneNonce]);
 
   /* apply Photo/Scan mode changes to the live scene */
   useEffect(() => {

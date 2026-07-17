@@ -113,16 +113,18 @@ const EDL_FRAG = /* glsl */ `
 `;
 
 export class PointCloudScene {
-  constructor(container) {
+  constructor(container, { safeMode = false } = {}) {
     this.container = container;
+    this.safeMode = safeMode;
     this.dirty = true;
     this.disposed = false;
     this.tween = null;
     this.mode = "points";
     this._continuous = false;
+    this.onContextLost = null;
 
     this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    this.renderer.setPixelRatio(safeMode ? 1 : Math.min(2, window.devicePixelRatio || 1));
     this.renderer.setClearColor("#05090F");
     /* if ANY shader fails to compile on this GPU, drop the EDL post pass
        rather than showing a black view */
@@ -133,6 +135,21 @@ export class PointCloudScene {
       }
     };
     container.appendChild(this.renderer.domElement);
+
+    /* GPU context loss = the "renders once, then black screen" failure.
+       Surface it so the app can rebuild in a lighter mode. */
+    this._onCtxLost = (e) => {
+      e.preventDefault();
+      this._running = false;
+      this.onContextLost?.();
+    };
+    this.renderer.domElement.addEventListener("webglcontextlost", this._onCtxLost, false);
+
+    /* browsers may evict a non-redrawn canvas front buffer under memory
+       pressure — a cheap periodic repaint heals it within seconds */
+    this._keepalive = setInterval(() => {
+      if (!this.disposed) this.wake();
+    }, 8000);
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(55, 1, 0.1, 10000);
@@ -153,7 +170,7 @@ export class PointCloudScene {
     this.center = new THREE.Vector3();
 
     /* ---- EDL post pass (WebGL2 only; falls back to direct render) ---- */
-    this.edlOk = !!this.renderer.capabilities.isWebGL2;
+    this.edlOk = !safeMode && !!this.renderer.capabilities.isWebGL2;
     if (this.edlOk) {
       try {
         const depthTexture = new THREE.DepthTexture(2, 2);
@@ -228,6 +245,11 @@ export class PointCloudScene {
     if (this.edlOk && this.mode === "points" && this.points) {
       try {
         const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+        if (size.x * size.y > 4200000) {
+          /* very large buffers (4K+): skip the post pass to halve GPU load */
+          this.renderer.render(this.scene, this.camera);
+          return;
+        }
         if (this.rt.width !== size.x || this.rt.height !== size.y) {
           this.rt.setSize(size.x, size.y);
           this.edlMaterial.uniforms.uResolution.value.set(size.x, size.y);
@@ -538,6 +560,8 @@ export class PointCloudScene {
   dispose() {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
+    clearInterval(this._keepalive);
+    this.renderer.domElement.removeEventListener("webglcontextlost", this._onCtxLost, false);
     this.resizeObserver.disconnect();
     this.controls.dispose();
     this.clearCloud();
