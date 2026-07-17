@@ -35,7 +35,7 @@ self.onmessage = async (e) => {
     if (msg.type === "demo") {
       finish(makeDemo(Math.min(msg.budget || 1200000, 1400000)));
     } else if (msg.type === "parse") {
-      finish(await parseBatch(msg.files || [], msg.budget));
+      finish(await parseBatch(msg.files || [], msg.budget, msg.focus || null, msg.center || null));
     }
   } catch (err) {
     self.postMessage({
@@ -271,7 +271,7 @@ function readRecord(dv, base, h, rgbOff, clsOff, clsMask, c) {
 
 /* ---------------- batch orchestration ---------------- */
 
-async function parseBatch(files, budget) {
+async function parseBatch(files, budget, focus, center) {
   if (!files.length) throw new Error("NOT_LAS");
 
   /* pass 1: build readers + parse headers */
@@ -313,7 +313,7 @@ async function parseBatch(files, budget) {
     totalKept += m.kept;
   }
   const anyRgb = metas.some((m) => fileHasRgb(m.h));
-  const c = makeCollector(totalKept, anyRgb);
+  const c = makeCollector(totalKept, anyRgb, center);
 
   /* pass 3: parse every file into the shared collector */
   const many = metas.length > 1;
@@ -330,7 +330,7 @@ async function parseBatch(files, budget) {
     const report = (frac) =>
       progress(((donePoints + frac * m.usable) / totalPoints) * 100, label);
     try {
-      if (m.h.isCopc) await loadCopcInto(c, m, report);
+      if (m.h.isCopc) await loadCopcInto(c, m, report, focus);
       else if (m.h.compressed) await parseLazInto(c, m, report);
       else await parseLasInto(c, m, report);
     } catch (err) {
@@ -344,6 +344,8 @@ async function parseBatch(files, budget) {
   const result = packResult(c, metas[0].h.format, totalPoints);
   result.fileCount = metas.length;
   result.skipped = skipped;
+  result.center = c.center;
+  result.copc = metas.length === 1 && metas[0].h.isCopc;
   return result;
 }
 
@@ -351,10 +353,26 @@ async function parseBatch(files, budget) {
 
 const keyDepth = (key) => Number(key.split("-")[0]);
 
-async function loadCopcInto(c, m, report) {
+/* does octree node `key` (within root cube) intersect the focus sphere? */
+function keyIntersectsFocus(key, cube, focus) {
+  if (!focus) return true;
+  const [d, x, y, z] = key.split("-").map(Number);
+  const size = (cube[3] - cube[0]) / (1 << d);
+  const min = [cube[0] + x * size, cube[1] + y * size, cube[2] + z * size];
+  let dist2 = 0;
+  const p = [focus.x, focus.y, focus.z];
+  for (let i = 0; i < 3; i++) {
+    const v = Math.max(min[i], Math.min(p[i], min[i] + size));
+    dist2 += (v - p[i]) * (v - p[i]);
+  }
+  return dist2 <= focus.r * focus.r;
+}
+
+async function loadCopcInto(c, m, report, focus) {
   const getter = readerGetter(m.reader);
   const copc = await Copc.create(getter);
   const lazPerf = await getLazPerf();
+  const cube = copc.info.cube;
 
   if (!c.center) {
     const { min, max } = copc.header;
@@ -365,8 +383,14 @@ async function loadCopcInto(c, m, report) {
     ];
   }
 
-  /* walk the hierarchy breadth-first, whole levels while they fit, and a
-     per-node subsample of the level that would overflow the budget */
+  /* Walk the hierarchy breadth-first, whole levels while they fit, and a
+     per-node subsample of the level that would overflow the budget.
+     With a focus sphere: shallow levels (context) load everywhere, deeper
+     levels only where they intersect the sphere — full captured density
+     for the area being sharpened. */
+  const wanted = (key) =>
+    focus ? keyDepth(key) <= 2 || keyIntersectsFocus(key, cube, focus) : true;
+
   let nodes = {};
   let pages = { "0-0-0-0": copc.info.rootHierarchyPage };
   const selected = [];
@@ -374,7 +398,7 @@ async function loadCopcInto(c, m, report) {
 
   for (let depth = 0; depth <= 24 && remaining > 0; depth++) {
     for (const key of Object.keys(pages)) {
-      if (keyDepth(key) <= depth) {
+      if (keyDepth(key) <= depth && wanted(key)) {
         const page = pages[key];
         delete pages[key];
         try {
@@ -387,10 +411,10 @@ async function loadCopcInto(c, m, report) {
       }
     }
     const level = Object.keys(nodes)
-      .filter((k) => keyDepth(k) === depth && nodes[k] && nodes[k].pointCount > 0)
+      .filter((k) => keyDepth(k) === depth && nodes[k] && nodes[k].pointCount > 0 && wanted(k))
       .map((k) => nodes[k]);
     if (!level.length) {
-      if (!Object.keys(pages).length) break;
+      if (!Object.keys(pages).some(wanted)) break;
       continue;
     }
     const levelCount = level.reduce((s, n) => s + n.pointCount, 0);

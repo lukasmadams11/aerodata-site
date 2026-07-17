@@ -1,7 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
+  Camera,
   Crosshair,
+  Expand,
   Files,
+  Focus,
   FolderOpen,
   HelpCircle,
   Map,
@@ -32,7 +35,19 @@ const IS_CONSTRAINED = (() => {
   return /Macintosh/i.test(ua) && navigator.maxTouchPoints > 1;
 })();
 
-const POINT_BUDGET = IS_CONSTRAINED ? 2000000 : 4500000;
+/* ?budget=N supports testing and power users */
+const URL_BUDGET =
+  typeof window !== "undefined"
+    ? Number(new URLSearchParams(window.location.search).get("budget")) || 0
+    : 0;
+const POINT_BUDGET = URL_BUDGET > 0 ? URL_BUDGET : IS_CONSTRAINED ? 2000000 : 4500000;
+
+/* Gaussian-splat "photo" models (DJI Terra 3DGS output and friends) */
+const SPLAT_RE = /\.(ply|splat|ksplat|spz)$/i;
+const splatFormatOf = (name) => {
+  const ext = (name.match(SPLAT_RE) || [])[1]?.toLowerCase();
+  return { ply: "Ply", splat: "Splat", ksplat: "KSplat", spz: "Spz" }[ext] || null;
+};
 
 const MB = 1024 * 1024;
 /* Plain (non-COPC) .laz must be decompressed whole inside the wasm heap — capped.
@@ -110,6 +125,8 @@ export default function ViewerApp() {
   const [modeNotice, setModeNotice] = useState("");
   const [announce, setAnnounce] = useState("");
   const [slow, setSlow] = useState(false);
+  const [viewMode, setViewMode] = useState("points");
+  const [splatState, setSplatState] = useState(null); /* null | {loading,percent} | {count} */
 
   const workerRef = useRef(null);
   const dataRef = useRef(null);
@@ -119,6 +136,12 @@ export default function ViewerApp() {
   const folderInputRef = useRef(null);
   const pendingSkipRef = useRef(0);
   const streamFallbackRef = useRef(null);
+  const splatUrlRef = useRef(null); /* { url, revoke } */
+  const pendingSplatRef = useRef(null); /* File waiting for the scan to finish */
+  const splatLoadRunningRef = useRef(false);
+  const sourceRef = useRef(null); /* { files, center } — for Sharpen reloads */
+  const sharpenedRef = useRef(false);
+  const snapshotRef = useRef(null); /* camera to restore after a sharpen */
   const loadGenRef = useRef(0);
   const abortRef = useRef(null);
   const helpButtonRef = useRef(null);
@@ -153,10 +176,21 @@ export default function ViewerApp() {
         worker.terminate(); /* reclaim the worker (and any grown wasm heap) immediately */
         workerRef.current = null;
         dataRef.current = msg;
+        if (sourceRef.current && msg.center) sourceRef.current.center = msg.center;
         setColorMode(msg.rgb ? "rgb" : "elevation");
         setPointSize(2);
+        setViewMode("points");
         const skipped = (msg.skipped || 0) + pendingSkipRef.current;
         pendingSkipRef.current = 0;
+        if (pendingSplatRef.current) {
+          splatUrlRef.current = {
+            url: URL.createObjectURL(pendingSplatRef.current),
+            revoke: true,
+            format: splatFormatOf(pendingSplatRef.current.name),
+          };
+          pendingSplatRef.current = null;
+          setSplatState({ loading: true, percent: 0 });
+        }
         setStage({
           kind: "ready",
           kept: msg.kept,
@@ -164,6 +198,8 @@ export default function ViewerApp() {
           hasRgb: !!msg.rgb,
           hasIntensity: msg.hasIntensity,
           fileCount: msg.fileCount || 1,
+          canSharpen: !!(msg.copc && sourceRef.current),
+          sharpened: sharpenedRef.current,
         });
         if (skipped > 0) {
           showNotice(
@@ -203,11 +239,49 @@ export default function ViewerApp() {
     return worker;
   };
 
+  const releaseSplatUrl = () => {
+    if (splatUrlRef.current?.revoke) URL.revokeObjectURL(splatUrlRef.current.url);
+    splatUrlRef.current = null;
+    pendingSplatRef.current = null;
+    splatLoadRunningRef.current = false;
+    setSplatState(null);
+  };
+
+  const openSplatOnly = (fileOrUrl) => {
+    beginLoad();
+    releaseSplatUrl();
+    loadSceneModule();
+    dataRef.current = null;
+    sourceRef.current = null;
+    sharpenedRef.current = false;
+    snapshotRef.current = null;
+    splatUrlRef.current =
+      typeof fileOrUrl === "string"
+        ? { url: fileOrUrl, revoke: false, format: splatFormatOf(fileOrUrl.split("?")[0]) }
+        : { url: URL.createObjectURL(fileOrUrl), revoke: true, format: splatFormatOf(fileOrUrl.name) };
+    setSplatState({ loading: true, percent: 0 });
+    setViewMode("splat");
+    setStage({
+      kind: "ready",
+      splatOnly: true,
+      kept: 0,
+      total: 0,
+      hasRgb: false,
+      hasIntensity: false,
+      fileCount: 1,
+    });
+  };
+
   const openFiles = async (list) => {
     const all = Array.from(list || []).filter(Boolean);
     if (!all.length) return;
     const viewing = sceneRef.current !== null;
     const scans = all.filter((f) => /\.la[sz]$/i.test(f.name));
+    const splats = all.filter((f) => SPLAT_RE.test(f.name));
+    if (!scans.length && splats.length) {
+      openSplatOnly(splats[0]);
+      return;
+    }
     if (!scans.length) {
       if (viewing) return; /* ignore an accidental mis-drop; keep the current 3D view */
       beginLoad();
@@ -247,8 +321,13 @@ export default function ViewerApp() {
       return;
     }
     beginLoad();
+    releaseSplatUrl();
     loadSceneModule();
     pendingSkipRef.current = tooBig;
+    pendingSplatRef.current = splats[0] || null;
+    sourceRef.current = { files: usable, center: null };
+    sharpenedRef.current = false;
+    snapshotRef.current = null;
     setStage({
       kind: "loading",
       percent: 0,
@@ -270,14 +349,22 @@ export default function ViewerApp() {
      support ranges, the worker reports code "RANGE" and we fall back to
      downloading the whole file (with the old size caps). */
   const openUrl = (src) => {
-    const gen = beginLoad();
-    loadSceneModule();
     let href = src;
     try {
       href = new URL(src, window.location.href).href;
     } catch {
       /* keep raw src */
     }
+    if (SPLAT_RE.test(href.split("?")[0])) {
+      openSplatOnly(href);
+      return;
+    }
+    const gen = beginLoad();
+    releaseSplatUrl();
+    loadSceneModule();
+    sourceRef.current = { files: [{ url: href }], center: null };
+    sharpenedRef.current = false;
+    snapshotRef.current = null;
     streamFallbackRef.current = { gen, src };
     setStage({ kind: "loading", percent: 0, phase: "Connecting to the scan…" });
     startWorker().postMessage({ type: "parse", files: [{ url: href }], budget: POINT_BUDGET });
@@ -341,7 +428,9 @@ export default function ViewerApp() {
         }
       }
       if (isStale(gen)) return;
-      startWorker().postMessage({ type: "parse", files: [new Blob(chunks)], budget: POINT_BUDGET });
+      const blob = new Blob(chunks);
+      sourceRef.current = { files: [blob], center: null };
+      startWorker().postMessage({ type: "parse", files: [blob], budget: POINT_BUDGET });
     } catch {
       if (isStale(gen)) return; /* aborted/superseded — not an error */
       setStage({
@@ -354,8 +443,55 @@ export default function ViewerApp() {
 
   const reset = () => {
     beginLoad();
+    releaseSplatUrl();
     dataRef.current = null;
+    sourceRef.current = null;
+    sharpenedRef.current = false;
+    snapshotRef.current = null;
+    setViewMode("points");
     setStage({ kind: "idle" });
+  };
+
+  /* Sharpen: reload the COPC source focused on what the camera is looking
+     at — deep octree levels stream in for that region only. */
+  const sharpen = () => {
+    const s = sceneRef.current;
+    const src = sourceRef.current;
+    if (!s || !src || !src.center) return;
+    const t = s.controls.target;
+    const radius = Math.max(8, s.camera.position.distanceTo(t) * 0.9);
+    const focus = {
+      x: t.x + src.center[0],
+      y: t.y + src.center[1],
+      z: t.z + src.center[2],
+      r: radius,
+    };
+    snapshotRef.current = { pos: s.camera.position.toArray(), target: t.toArray() };
+    sharpenedRef.current = true;
+    beginLoad();
+    setStage({ kind: "loading", percent: 0, phase: "Sharpening this area…" });
+    startWorker().postMessage({
+      type: "parse",
+      files: src.files,
+      budget: POINT_BUDGET,
+      focus,
+      center: src.center,
+    });
+  };
+
+  const fullSite = () => {
+    const src = sourceRef.current;
+    if (!src) return;
+    snapshotRef.current = null;
+    sharpenedRef.current = false;
+    beginLoad();
+    setStage({ kind: "loading", percent: 0, phase: "Loading the full site…" });
+    startWorker().postMessage({
+      type: "parse",
+      files: src.files,
+      budget: POINT_BUDGET,
+      center: src.center,
+    });
   };
 
   /* load from ?src=… links */
@@ -439,6 +575,8 @@ export default function ViewerApp() {
 
   /* ---------------- 3D scene lifecycle (lazy chunk) ---------------- */
 
+  const [sceneEpoch, setSceneEpoch] = useState(0);
+
   useEffect(() => {
     if (stage.kind !== "ready" || !mountRef.current) return;
     let cancelled = false;
@@ -447,9 +585,25 @@ export default function ViewerApp() {
       .then(({ PointCloudScene }) => {
         if (cancelled || !mountRef.current) return;
         scene = new PointCloudScene(mountRef.current);
-        scene.setData(dataRef.current);
+        if (dataRef.current) {
+          const snap = snapshotRef.current;
+          scene.setData(dataRef.current, { keepCamera: !!snap });
+          if (snap) {
+            scene.camera.position.fromArray(snap.pos);
+            scene.controls.target.fromArray(snap.target);
+            scene.controls.update();
+            scene.wake();
+            snapshotRef.current = null;
+          }
+        }
         sceneRef.current = scene;
-        window.__viewer = { stage: "ready", kept: dataRef.current.kept, total: dataRef.current.total, scene };
+        setSceneEpoch((e) => e + 1);
+        window.__viewer = {
+          stage: "ready",
+          kept: dataRef.current?.kept || 0,
+          total: dataRef.current?.total || 0,
+          scene,
+        };
       })
       .catch(() => {
         if (!cancelled)
@@ -465,6 +619,59 @@ export default function ViewerApp() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stage.kind]);
+
+  /* apply Photo/Scan mode changes to the live scene */
+  useEffect(() => {
+    sceneRef.current?.setMode(viewMode);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMode, sceneEpoch]);
+
+  /* load a pending splat (photo view) once the scene exists */
+  useEffect(() => {
+    const scene = sceneRef.current;
+    const su = splatUrlRef.current;
+    if (!scene || !su || !splatState?.loading || splatLoadRunningRef.current) return;
+    splatLoadRunningRef.current = true;
+    let cancelled = false;
+    scene
+      .setSplat(
+        su.url,
+        (p) => {
+          if (!cancelled) setSplatState({ loading: true, percent: p });
+        },
+        su.format
+      )
+      .then((count) => {
+        if (cancelled) return;
+        if (su.revoke) {
+          URL.revokeObjectURL(su.url);
+          su.revoke = false;
+        }
+        setSplatState({ count });
+        setViewMode("splat");
+        setAnnounce("Photo view loaded.");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        releaseSplatUrl();
+        if (dataRef.current) {
+          showNotice("The photo view couldn't be loaded — showing the scan instead.", 6000);
+        } else {
+          setStage({
+            kind: "error",
+            message:
+              "This 3D photo model couldn't be opened. It may not be a Gaussian-splat file — or contact us and we'll help.",
+          });
+        }
+      })
+      .finally(() => {
+        splatLoadRunningRef.current = false;
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sceneEpoch, splatState?.loading]);
 
   /* ---------------- announcements, focus, slow-load hint ---------------- */
 
@@ -597,6 +804,9 @@ export default function ViewerApp() {
 
   /* ---------------- render ---------------- */
 
+  const pointsUi = stage.kind === "ready" && viewMode === "points" && !stage.splatOnly;
+  const hasBothViews = stage.kind === "ready" && !stage.splatOnly && !!splatState?.count;
+
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-[#030609] font-sans text-slate-100">
       {/* screen-reader status channel — persistent across stage changes */}
@@ -609,10 +819,16 @@ export default function ViewerApp() {
         {stage.kind === "ready" && (
           <div className="flex items-center gap-4">
             <span className="hidden font-mono text-[12px] tracking-hud-tight text-slate-400 md:block">
-              {(stage.fileCount > 1 ? `${stage.fileCount} files · ` : "") +
-                (stage.kept < stage.total
-                  ? `Fast preview — ${formatPoints(stage.kept)} points`
-                  : `${formatPoints(stage.kept)} points`)}
+              {stage.splatOnly
+                ? splatState?.count
+                  ? `Photo model — ${formatPoints(splatState.count)} splats`
+                  : "Photo model"
+                : (stage.fileCount > 1 ? `${stage.fileCount} files · ` : "") +
+                  (stage.sharpened
+                    ? `Sharpened — ${formatPoints(stage.kept)} points`
+                    : stage.kept < stage.total
+                      ? `Fast preview — ${formatPoints(stage.kept)} points`
+                      : `${formatPoints(stage.kept)} points`)}
             </span>
             <button
               ref={openAnotherRef}
@@ -676,7 +892,7 @@ export default function ViewerApp() {
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".las,.laz"
+                accept=".las,.laz,.ply,.splat,.ksplat,.spz"
                 multiple
                 className="hidden"
                 tabIndex={-1}
@@ -701,8 +917,8 @@ export default function ViewerApp() {
                 }}
               />
               <p className="text-sm text-slate-400">
-                Works with .las, .laz, and .copc.laz files — tiled scans open
-                together as one map
+                Works with .las, .laz, and .copc.laz scans and 3D photo models
+                (.ply / .splat / .ksplat) — tiled scans open together as one map
               </p>
             </div>
 
@@ -811,21 +1027,21 @@ export default function ViewerApp() {
             </p>
 
             {/* legends */}
-            {colorMode === "elevation" && (
+            {pointsUi && colorMode === "elevation" && (
               <div className="pointer-events-none absolute right-4 top-4 flex items-center gap-2.5 rounded-lg border border-white/10 bg-[#030609]/85 px-3.5 py-2.5">
                 <span className="text-sm text-slate-300">Low</span>
                 <span className="h-2.5 w-28 rounded-full bg-[linear-gradient(to_right,#0000ff,#00ffff,#00ff00,#ffff00,#ff0000)]" />
                 <span className="text-sm text-slate-300">High</span>
               </div>
             )}
-            {colorMode === "intensity" && (
+            {pointsUi && colorMode === "intensity" && (
               <div className="pointer-events-none absolute right-4 top-4 flex items-center gap-2.5 rounded-lg border border-white/10 bg-[#030609]/85 px-3.5 py-2.5">
                 <span className="text-sm text-slate-300">Dark</span>
                 <span className="h-2.5 w-28 rounded-full bg-gradient-to-r from-slate-900 to-cyan-100" />
                 <span className="text-sm text-slate-300">Bright</span>
               </div>
             )}
-            {colorMode === "classification" && (
+            {pointsUi && colorMode === "classification" && (
               <div className="pointer-events-none absolute right-4 top-4 flex flex-col gap-1.5 rounded-lg border border-white/10 bg-[#030609]/85 px-3.5 py-3">
                 {CLASS_LEGEND.map((c) => (
                   <span key={c.key} className="flex items-center gap-2.5 text-sm text-slate-300">
@@ -837,6 +1053,16 @@ export default function ViewerApp() {
                   </span>
                 ))}
               </div>
+            )}
+
+            {/* photo-view loading chip */}
+            {splatState?.loading && (
+              <p
+                role="status"
+                className="absolute left-1/2 top-4 -translate-x-1/2 rounded-lg border border-white/15 bg-[#030609]/90 px-4 py-2.5 text-sm text-slate-200"
+              >
+                Loading photo view… {Math.round(splatState.percent || 0)}%
+              </p>
             )}
 
             {/* unavailable-mode notice */}
@@ -851,6 +1077,38 @@ export default function ViewerApp() {
 
             {/* toolbar */}
             <div className="absolute inset-x-0 bottom-0 flex flex-wrap items-center justify-center gap-2 border-t border-white/10 bg-[#030609]/90 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] pr-[max(0.75rem,env(safe-area-inset-right))] sm:gap-3">
+              {hasBothViews && (
+                <div
+                  className="flex items-center gap-1.5 rounded-xl border border-amber-400/25 bg-white/[0.03] p-1.5"
+                  role="group"
+                  aria-label="View style"
+                >
+                  <button
+                    aria-pressed={viewMode === "splat"}
+                    onClick={() => setViewMode("splat")}
+                    className={`flex min-h-11 items-center gap-2 rounded-lg px-4 py-2 text-sm transition-colors ${
+                      viewMode === "splat"
+                        ? "bg-amber-400/20 text-amber-200 ring-1 ring-inset ring-amber-400"
+                        : "text-slate-300 hover:bg-white/5 hover:text-white"
+                    }`}
+                  >
+                    <Camera className="h-4 w-4" /> Photo view
+                  </button>
+                  <button
+                    aria-pressed={viewMode === "points"}
+                    onClick={() => setViewMode("points")}
+                    className={`flex min-h-11 items-center gap-2 rounded-lg px-4 py-2 text-sm transition-colors ${
+                      viewMode === "points"
+                        ? "bg-cyan-400/20 text-cyan-200 ring-1 ring-inset ring-cyan-400"
+                        : "text-slate-300 hover:bg-white/5 hover:text-white"
+                    }`}
+                  >
+                    <Mountain className="h-4 w-4" /> Scan view
+                  </button>
+                </div>
+              )}
+
+              {pointsUi && (
               <div
                 className="flex flex-wrap items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] p-1.5"
                 role="group"
@@ -884,6 +1142,7 @@ export default function ViewerApp() {
                   );
                 })}
               </div>
+              )}
 
               <div
                 className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] p-1.5"
@@ -911,6 +1170,24 @@ export default function ViewerApp() {
                 </button>
               </div>
 
+              {pointsUi && stage.canSharpen && (
+                <div
+                  className="flex items-center gap-1.5 rounded-xl border border-cyan-400/25 bg-white/[0.03] p-1.5"
+                  role="group"
+                  aria-label="Detail"
+                >
+                  <button onClick={sharpen} className={toolbarBtn} title="Reload every captured point for the area you're looking at">
+                    <Focus className="h-4 w-4" /> Sharpen this area
+                  </button>
+                  {stage.sharpened && (
+                    <button onClick={fullSite} className={toolbarBtn}>
+                      <Expand className="h-4 w-4" /> Full site
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {pointsUi && (
               <div
                 className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.03] p-1.5"
                 role="group"
@@ -932,6 +1209,7 @@ export default function ViewerApp() {
                   <Plus className="h-5 w-5" />
                 </button>
               </div>
+              )}
 
               <button
                 ref={helpButtonRef}

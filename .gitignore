@@ -5,5 +5,8 @@ _archive/
 *.log
 public/*.las
 public/*.laz
+public/*.splat
+public/*.ply
+public/*.ksplat
 .DS_Store
 Thumbs.db

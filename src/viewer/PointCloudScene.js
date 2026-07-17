@@ -1,8 +1,13 @@
 /*
  * PointCloudScene — three.js wrapper for the client scan viewer.
- * Owns the renderer, camera, controls, and the single Points object.
- * The rAF loop parks itself after ~30 idle frames; every external
- * repaint request goes through wake().
+ *
+ * Renders the point cloud through an Eye-Dome Lighting (EDL) post pass —
+ * the depth-aware shading every professional point-cloud tool uses — and
+ * can additionally host a Gaussian-splat "photo view" of the same site
+ * (lazy-loaded @mkkellogg/gaussian-splats-3d DropInViewer).
+ *
+ * The rAF loop parks itself when idle; wake() is the single repaint entry.
+ * Splat mode keeps the loop continuous (the splat sorter is async).
  */
 
 import * as THREE from "three";
@@ -36,12 +41,78 @@ const RAMP_LUT = (() => {
 
 const UP = new THREE.Vector3(0, 0, 1);
 
+/* percentile bounds over sampled values — same guard the worker uses */
+function pctBounds(xs, ys, zs) {
+  const pct = (arr) => {
+    arr.sort((a, b) => a - b);
+    const lo = arr[Math.floor(0.005 * (arr.length - 1))];
+    const hi = arr[Math.ceil(0.995 * (arr.length - 1))];
+    const pad = Math.max(0.5, 0.02 * (hi - lo));
+    return [lo - pad, hi + pad];
+  };
+  const [x0, x1] = pct(xs);
+  const [y0, y1] = pct(ys);
+  const [z0, z1] = pct(zs);
+  return { min: [x0, y0, z0], max: [x1, y1, z1] };
+}
+
+const EDL_VERT = /* glsl */ `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position.xy, 0.0, 1.0);
+  }
+`;
+
+const EDL_FRAG = /* glsl */ `
+  precision highp float;
+  uniform sampler2D tColor;
+  uniform sampler2D tDepth;
+  uniform vec2 uResolution;
+  uniform float uNear;
+  uniform float uFar;
+  uniform float uStrength;
+  varying vec2 vUv;
+
+  float linearDepth(float d) {
+    float z = d * 2.0 - 1.0;
+    return (2.0 * uNear * uFar) / (uFar + uNear - z * (uFar - uNear));
+  }
+
+  void main() {
+    vec4 color = texture2D(tColor, vUv);
+    float dRaw = texture2D(tDepth, vUv).x;
+    if (dRaw >= 1.0) {
+      gl_FragColor = color;
+      return;
+    }
+    float logC = log2(linearDepth(dRaw));
+    vec2 px = 1.4 / uResolution;
+    float response = 0.0;
+    const vec2 DIRS[8] = vec2[8](
+      vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0),
+      vec2(0.7, 0.7), vec2(-0.7, 0.7), vec2(0.7, -0.7), vec2(-0.7, -0.7)
+    );
+    for (int i = 0; i < 8; i++) {
+      float dn = texture2D(tDepth, vUv + DIRS[i] * px).x;
+      if (dn < 1.0) {
+        response += max(0.0, logC - log2(linearDepth(dn)));
+      }
+    }
+    response /= 8.0;
+    float shade = clamp(exp(-response * 60.0 * uStrength), 0.25, 1.0);
+    gl_FragColor = vec4(color.rgb * shade, color.a);
+  }
+`;
+
 export class PointCloudScene {
   constructor(container) {
     this.container = container;
     this.dirty = true;
     this.disposed = false;
     this.tween = null;
+    this.mode = "points";
+    this._continuous = false;
 
     this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
     this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
@@ -56,15 +127,45 @@ export class PointCloudScene {
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.screenSpacePanning = true;
-    this.controls.maxPolarAngle = Math.PI * 0.49; /* never below the ground plane */
+    this.controls.maxPolarAngle = Math.PI * 0.49;
 
     this.points = null;
     this.grid = null;
     this.data = null;
+    this.splat = null;
+    this.splatBounds = null;
     this.diag = 100;
     this.center = new THREE.Vector3();
 
-    /* self-parking render loop */
+    /* ---- EDL post pass (WebGL2 only; falls back to direct render) ---- */
+    this.edlOk = !!this.renderer.capabilities.isWebGL2;
+    if (this.edlOk) {
+      try {
+        const depthTexture = new THREE.DepthTexture(2, 2);
+        this.rt = new THREE.WebGLRenderTarget(2, 2, { depthTexture });
+        this.edlMaterial = new THREE.ShaderMaterial({
+          vertexShader: EDL_VERT,
+          fragmentShader: EDL_FRAG,
+          uniforms: {
+            tColor: { value: this.rt.texture },
+            tDepth: { value: depthTexture },
+            uResolution: { value: new THREE.Vector2(2, 2) },
+            uNear: { value: 0.1 },
+            uFar: { value: 10000 },
+            uStrength: { value: 1.0 },
+          },
+          depthTest: false,
+          depthWrite: false,
+        });
+        this.edlScene = new THREE.Scene();
+        this.edlScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.edlMaterial));
+        this.edlCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      } catch {
+        this.edlOk = false;
+      }
+    }
+
+    /* ---- self-parking render loop ---- */
     this._idleFrames = 0;
     this._running = false;
     this._loop = () => {
@@ -80,12 +181,12 @@ export class PointCloudScene {
       } else {
         moved = this.controls.update();
       }
-      if (moved || this.dirty) {
+      if (moved || this.dirty || this._continuous) {
         this.dirty = false;
         this._idleFrames = 0;
-        this.renderer.render(this.scene, this.camera);
+        this.renderFrame();
       } else if (++this._idleFrames >= 30) {
-        this._running = false; /* park until the next wake() */
+        this._running = false;
         return;
       }
       this.raf = requestAnimationFrame(this._loop);
@@ -107,6 +208,25 @@ export class PointCloudScene {
     this.wake();
   }
 
+  renderFrame() {
+    /* EDL only benefits the point cloud; splats render direct */
+    if (this.edlOk && this.mode === "points" && this.points) {
+      const size = this.renderer.getDrawingBufferSize(new THREE.Vector2());
+      if (this.rt.width !== size.x || this.rt.height !== size.y) {
+        this.rt.setSize(size.x, size.y);
+        this.edlMaterial.uniforms.uResolution.value.set(size.x, size.y);
+      }
+      this.edlMaterial.uniforms.uNear.value = this.camera.near;
+      this.edlMaterial.uniforms.uFar.value = this.camera.far;
+      this.renderer.setRenderTarget(this.rt);
+      this.renderer.render(this.scene, this.camera);
+      this.renderer.setRenderTarget(null);
+      this.renderer.render(this.edlScene, this.edlCamera);
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
+  }
+
   resize() {
     if (this.disposed) return;
     const w = Math.max(1, this.container.clientWidth);
@@ -119,7 +239,21 @@ export class PointCloudScene {
     this.wake();
   }
 
-  setData(data) {
+  applyBounds(bounds) {
+    const { min, max } = bounds;
+    const dx = max[0] - min[0];
+    const dy = max[1] - min[1];
+    const dz = max[2] - min[2];
+    this.diag = Math.max(1, Math.hypot(dx, dy, dz));
+    this.center.set((min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2);
+    this.camera.near = this.diag / 1000;
+    this.camera.far = this.diag * 12;
+    this.camera.updateProjectionMatrix();
+    this.controls.minDistance = this.diag * 0.02;
+    this.controls.maxDistance = this.diag * 4;
+  }
+
+  setData(data, { keepCamera = false } = {}) {
     this.clearCloud();
     this.data = data;
 
@@ -135,30 +269,121 @@ export class PointCloudScene {
       vertexColors: true,
     });
     this.points = new THREE.Points(geometry, this.material);
+    this.points.visible = this.mode === "points";
     this.scene.add(this.points);
 
-    const { min, max } = data.bounds;
-    const dx = max[0] - min[0];
-    const dy = max[1] - min[1];
-    const dz = max[2] - min[2];
-    this.diag = Math.max(1, Math.hypot(dx, dy, dz));
-    this.center.set((min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2);
+    const savedPos = keepCamera ? this.camera.position.clone() : null;
+    const savedTarget = keepCamera ? this.controls.target.clone() : null;
+    this.applyBounds(data.bounds);
 
-    /* faint reference grid just under the lowest point */
-    const gridSize = Math.max(dx, dy) * 1.4;
+    const { min, max } = data.bounds;
+    const gridSize = Math.max(max[0] - min[0], max[1] - min[1]) * 1.4;
     this.grid = new THREE.GridHelper(gridSize, 20, 0x1e293b, 0x101a29);
-    this.grid.rotation.x = Math.PI / 2; /* GridHelper is XZ; our world is Z-up */
-    this.grid.position.set(this.center.x, this.center.y, min[2] - dz * 0.02);
+    this.grid.rotation.x = Math.PI / 2;
+    this.grid.position.set(this.center.x, this.center.y, min[2] - (max[2] - min[2]) * 0.02);
+    this.grid.visible = this.mode === "points";
     this.scene.add(this.grid);
 
-    this.camera.near = this.diag / 1000;
-    this.camera.far = this.diag * 12;
-    this.camera.updateProjectionMatrix();
-    this.controls.minDistance = this.diag * 0.02;
-    this.controls.maxDistance = this.diag * 4;
-
     this.setColorMode(data.rgb ? "rgb" : "elevation");
-    this.fit(false);
+    if (keepCamera && savedPos) {
+      this.camera.position.copy(savedPos);
+      this.controls.target.copy(savedTarget);
+      this.controls.update();
+      this.wake();
+    } else {
+      this.fit(false);
+    }
+  }
+
+  /* ---- gaussian splat "photo view" ---- */
+
+  async setSplat(url, onProgress, formatName) {
+    const GS = await import("@mkkellogg/gaussian-splats-3d");
+    if (this.disposed) return 0;
+    const dropIn = new GS.DropInViewer({
+      sharedMemoryForWorkers: false,
+      gpuAcceleratedSort: false,
+      freeIntermediateSplatData: true,
+    });
+    const options = {
+      showLoadingUI: false,
+      /* fully load before resolving, and skip the reveal animation — the
+         model must be complete on the first rendered frame (our loop
+         renders on demand, not continuously) */
+      progressiveLoad: false,
+      sceneRevealMode: GS.SceneRevealMode?.Instant,
+      onProgress: (percent) => {
+        if (typeof percent === "number") onProgress?.(percent);
+      },
+    };
+    /* object URLs have no extension — the format must be passed explicitly */
+    if (formatName && GS.SceneFormat && GS.SceneFormat[formatName] !== undefined) {
+      options.format = GS.SceneFormat[formatName];
+    }
+    await dropIn.addSplatScene(url, options);
+    if (this.disposed) {
+      try { dropIn.viewer?.dispose(); } catch { /* best effort */ }
+      return 0;
+    }
+    this.splat = dropIn;
+    this.scene.add(dropIn);
+
+    /* the library reveals the scene radially over many update() ticks —
+       snap the visible region to full so the first frame shows everything */
+    try {
+      const m = dropIn.viewer?.getSplatMesh?.();
+      if (m && typeof m.maxSplatDistanceFromSceneCenter === "number") {
+        m.visibleRegionBufferRadius = m.maxSplatDistanceFromSceneCenter;
+        m.visibleRegionRadius = m.maxSplatDistanceFromSceneCenter;
+        m.visibleRegionFadeStartRadius = m.maxSplatDistanceFromSceneCenter;
+        m.updateVisibleRegionFadeDistance?.(GS.SceneRevealMode?.Instant);
+      }
+    } catch {
+      /* cosmetic only */
+    }
+
+    let count = 0;
+    try {
+      const mesh = dropIn.viewer?.getSplatMesh?.();
+      if (mesh?.getSplatCount) {
+        count = mesh.getSplatCount();
+        const v = new THREE.Vector3();
+        const xs = [], ys = [], zs = [];
+        const step = Math.max(1, Math.floor(count / 5000));
+        for (let i = 0; i < count; i += step) {
+          mesh.getSplatCenter(i, v, true);
+          xs.push(v.x);
+          ys.push(v.y);
+          zs.push(v.z);
+        }
+        if (xs.length > 8) this.splatBounds = pctBounds(xs, ys, zs);
+      }
+    } catch {
+      /* bounds stay null — camera keeps whatever frame it has */
+    }
+
+    if (!this.data && this.splatBounds) {
+      this.applyBounds(this.splatBounds);
+      this.fit(false);
+    }
+    this.setMode("splat");
+    return count;
+  }
+
+  setMode(mode) {
+    this.mode = mode;
+    if (this.points) this.points.visible = mode === "points";
+    if (this.grid) this.grid.visible = mode === "points";
+    if (this.splat) this.splat.visible = mode === "splat";
+    this._continuous = mode === "splat" && !!this.splat;
+    if (mode === "points" && this.data) this.fitIfLost();
+    this.wake();
+  }
+
+  fitIfLost() {
+    /* if the camera drifted into a splat-only frame with no points on
+       screen, a mode switch shouldn't strand the user — cheap guard */
+    if (!Number.isFinite(this.camera.position.lengthSq())) this.fit(false);
   }
 
   setColorMode(mode) {
@@ -186,7 +411,6 @@ export class PointCloudScene {
         out[i * 3 + 2] = c[2];
       }
     } else {
-      /* elevation via LUT — ~7x faster than computing HSL per point */
       const pos = d.positions;
       for (let i = 0; i < n; i++) {
         let idx = (((pos[i * 3 + 2] - zmin) / zrange) * 255) | 0;
@@ -210,7 +434,7 @@ export class PointCloudScene {
     }
   }
 
-  /* ---------- camera moves ---------- */
+  /* ---- camera moves ---- */
 
   fit(animate = true) {
     const dist = this.diag * 0.85;
@@ -223,7 +447,6 @@ export class PointCloudScene {
     this.moveCamera(pos, this.center.clone(), animate);
   }
 
-  /* factor > 1 zooms out, < 1 zooms in (distance multiplier) */
   zoomBy(factor) {
     const offset = this.camera.position.clone().sub(this.controls.target);
     offset.setLength(
@@ -234,7 +457,6 @@ export class PointCloudScene {
     this.wake();
   }
 
-  /* keyboard orbit: yaw around world Z, pitch around the camera's right axis */
   orbit(dYaw, dPitch) {
     const offset = this.camera.position.clone().sub(this.controls.target);
     offset.applyAxisAngle(UP, dYaw);
@@ -276,7 +498,7 @@ export class PointCloudScene {
     if (p >= 1) this.tween = null;
   }
 
-  /* ---------- teardown ---------- */
+  /* ---- teardown ---- */
 
   clearCloud() {
     if (this.points) {
@@ -299,6 +521,15 @@ export class PointCloudScene {
     this.resizeObserver.disconnect();
     this.controls.dispose();
     this.clearCloud();
+    if (this.splat) {
+      this.scene.remove(this.splat);
+      try { this.splat.viewer?.dispose(); } catch { /* best effort */ }
+      this.splat = null;
+    }
+    if (this.rt) {
+      this.rt.dispose();
+      this.edlMaterial.dispose();
+    }
     this.renderer.dispose();
     if (this.renderer.domElement.parentNode === this.container) {
       this.container.removeChild(this.renderer.domElement);
