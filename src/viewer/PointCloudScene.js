@@ -540,6 +540,29 @@ export class PointCloudScene {
     if (p >= 1) this.tween = null;
   }
 
+  /* true when a fresh render produced only background pixels (used by the
+     app's black-screen watchdog) */
+  isShowingNothing() {
+    if (this.disposed || (!this.points && !this.splat)) return false;
+    try {
+      this.renderFrame();
+      const gl = this.renderer.getContext();
+      if (!gl || (gl.isContextLost && gl.isContextLost())) return false;
+      const w = gl.drawingBufferWidth;
+      const h = gl.drawingBufferHeight;
+      const px = new Uint8Array(4);
+      for (let i = 0; i < 24; i++) {
+        const x = Math.floor((((i % 6) + 0.5) / 6) * w);
+        const y = Math.floor(((Math.floor(i / 6) + 0.5) / 4) * h);
+        gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        if (Math.abs(px[0] - 5) > 3 || Math.abs(px[1] - 9) > 3 || Math.abs(px[2] - 15) > 3) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /* ---- teardown ---- */
 
   clearCloud() {

@@ -18,6 +18,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { CLASS_LEGEND } from "./classLegend.js";
+import { diag, diagReport } from "./diag.js";
 
 /* ------------------------------------------------------------------ */
 /*  Device budgets                                                     */
@@ -128,6 +129,22 @@ export default function ViewerApp() {
   const [slow, setSlow] = useState(false);
   const [viewMode, setViewMode] = useState("points");
   const [splatState, setSplatState] = useState(null); /* null | {loading,percent} | {count} */
+  const [blackDetected, setBlackDetected] = useState(false);
+  const [reportCopied, setReportCopied] = useState(false);
+  const lastPhaseRef = useRef("");
+
+  const copyReport = () => {
+    const text = diagReport();
+    const done = () => {
+      setReportCopied(true);
+      setTimeout(() => setReportCopied(false), 3000);
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(done).catch(() => window.prompt("Copy this report:", text));
+    } else {
+      window.prompt("Copy this report:", text);
+    }
+  };
 
   const workerRef = useRef(null);
   const dataRef = useRef(null);
@@ -175,8 +192,20 @@ export default function ViewerApp() {
       if (workerRef.current !== worker) return; /* stale message from a superseded worker */
       const msg = e.data;
       if (msg.type === "progress") {
+        if (msg.phase !== lastPhaseRef.current) {
+          lastPhaseRef.current = msg.phase;
+          diag("phase", msg.phase);
+        }
         setStage({ kind: "loading", percent: msg.percent, phase: msg.phase });
       } else if (msg.type === "done") {
+        diag("worker done", {
+          kept: msg.kept,
+          total: msg.total,
+          files: msg.fileCount,
+          skipped: msg.skipped,
+          copc: !!msg.copc,
+          rgb: !!msg.rgb,
+        });
         worker.terminate(); /* reclaim the worker (and any grown wasm heap) immediately */
         workerRef.current = null;
         dataRef.current = msg;
@@ -214,6 +243,7 @@ export default function ViewerApp() {
           );
         }
       } else if (msg.type === "error") {
+        diag("worker error", { code: msg.code, msg: String(msg.message).slice(0, 120) });
         worker.terminate();
         workerRef.current = null;
         const fb = streamFallbackRef.current;
@@ -252,6 +282,10 @@ export default function ViewerApp() {
   };
 
   const openSplatOnly = (fileOrUrl) => {
+    diag("openSplatOnly", {
+      name: typeof fileOrUrl === "string" ? fileOrUrl.slice(-60) : fileOrUrl.name,
+      sizeMB: typeof fileOrUrl === "string" ? undefined : Math.round(fileOrUrl.size / 1048576),
+    });
     beginLoad();
     releaseSplatUrl();
     loadSceneModule();
@@ -282,6 +316,13 @@ export default function ViewerApp() {
     const viewing = sceneRef.current !== null;
     const scans = all.filter((f) => /\.la[sz]$/i.test(f.name));
     const splats = all.filter((f) => SPLAT_RE.test(f.name));
+    diag("openFiles", {
+      total: all.length,
+      scans: scans.length,
+      splats: splats.length,
+      first: (scans[0] || splats[0] || all[0])?.name,
+      firstMB: Math.round(((scans[0] || splats[0] || all[0])?.size || 0) / 1048576),
+    });
     if (!scans.length && splats.length) {
       openSplatOnly(splats[0]);
       if (splats.length > 1) {
@@ -592,6 +633,7 @@ export default function ViewerApp() {
      2nd loss → reload the scan at reduced point count
      after that → honest error with advice */
   const handleContextLost = () => {
+    diag("CONTEXT LOST", { alreadySafe: safeModeRef.current, splatOnly: !dataRef.current });
     if (!safeModeRef.current) {
       safeModeRef.current = true;
       showNotice("Your graphics driver restarted — switching to a lighter display mode…", 6000);
@@ -642,6 +684,11 @@ export default function ViewerApp() {
         if (cancelled || !mountRef.current) return;
         scene = new PointCloudScene(mountRef.current, { safeMode: safeModeRef.current });
         scene.onContextLost = handleContextLost;
+        diag("scene created", {
+          safeMode: safeModeRef.current,
+          edlOk: scene.edlOk,
+          hasData: !!dataRef.current,
+        });
         if (dataRef.current) {
           const snap = snapshotRef.current;
           scene.setData(dataRef.current, { keepCamera: !!snap });
@@ -683,6 +730,35 @@ export default function ViewerApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewMode, sceneEpoch]);
 
+  /* black-screen watchdog: if content is loaded but two consecutive checks
+     see only background pixels, surface the problem instead of hiding it */
+  useEffect(() => {
+    if (stage.kind !== "ready") {
+      setBlackDetected(false);
+      return;
+    }
+    let strikes = 0;
+    const id = setInterval(() => {
+      const s = sceneRef.current;
+      if (!s || splatState?.loading) {
+        strikes = 0;
+        return;
+      }
+      if (s.isShowingNothing()) {
+        strikes++;
+        if (strikes >= 2) {
+          diag("BLACK SCREEN DETECTED");
+          setBlackDetected(true);
+          clearInterval(id);
+        }
+      } else {
+        strikes = 0;
+      }
+    }, 3000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage.kind, sceneEpoch, splatState?.loading]);
+
   /* load a pending splat (photo view) once the scene exists */
   useEffect(() => {
     const scene = sceneRef.current;
@@ -700,13 +776,15 @@ export default function ViewerApp() {
       )
       .then((count) => {
         if (cancelled) return;
+        diag("splat loaded", { count });
         /* keep the object URL alive — a GPU-reset rebuild needs to reload it */
         setSplatState({ count });
         setViewMode("splat");
         setAnnounce("Photo view loaded.");
       })
-      .catch(() => {
+      .catch((err) => {
         if (cancelled) return;
+        diag("splat FAILED", { msg: String(err?.message || err).slice(0, 150) });
         releaseSplatUrl();
         if (dataRef.current) {
           showNotice("The photo view couldn't be loaded — showing the scan instead.", 6000);
@@ -1051,6 +1129,12 @@ export default function ViewerApp() {
                 Choose a file instead
               </button>
             )}
+            <button
+              onClick={copyReport}
+              className="min-h-11 rounded-lg border border-white/15 px-5 py-2 text-sm text-slate-300 transition-colors hover:border-cyan-400/50 hover:text-cyan-300"
+            >
+              {reportCopied ? "Copied — paste it to us!" : "Copy problem report"}
+            </button>
             <p className="text-sm text-slate-400">
               Still stuck? Email us at{" "}
               <a
@@ -1106,6 +1190,39 @@ export default function ViewerApp() {
                     {c.label}
                   </span>
                 ))}
+              </div>
+            )}
+
+            {/* black-screen helper */}
+            {blackDetected && (
+              <div className="absolute inset-x-0 top-4 z-40 mx-auto w-fit max-w-[94%] rounded-xl border border-amber-400/40 bg-[#0A121C] px-5 py-4 text-center">
+                <p className="text-sm leading-relaxed text-slate-200">
+                  The view looks blank. Press <strong>Reset view</strong> — and if it
+                  stays black, copy the report and send it to us.
+                </p>
+                <div className="mt-3 flex flex-wrap justify-center gap-2">
+                  <button
+                    onClick={() => {
+                      sceneRef.current?.fit();
+                      setBlackDetected(false);
+                    }}
+                    className="min-h-11 rounded-lg border border-white/15 px-4 text-sm text-slate-200 transition-colors hover:border-cyan-400/50"
+                  >
+                    Reset view
+                  </button>
+                  <button
+                    onClick={copyReport}
+                    className="min-h-11 rounded-lg bg-amber-400 px-4 text-sm font-semibold text-[#231603] transition-colors hover:bg-amber-300"
+                  >
+                    {reportCopied ? "Copied!" : "Copy problem report"}
+                  </button>
+                  <button
+                    onClick={() => setBlackDetected(false)}
+                    className="min-h-11 rounded-lg px-3 text-sm text-slate-400 transition-colors hover:text-white"
+                  >
+                    Dismiss
+                  </button>
+                </div>
               </div>
             )}
 
@@ -1331,9 +1448,15 @@ export default function ViewerApp() {
                 </li>
               </ul>
               <button
+                onClick={copyReport}
+                className="mt-6 w-full rounded-xl border border-white/15 px-6 py-3.5 text-sm text-slate-200 transition-colors hover:border-cyan-400/50"
+              >
+                {reportCopied ? "Copied — paste it to us!" : "Something wrong? Copy a problem report"}
+              </button>
+              <button
                 ref={gotItRef}
                 onClick={() => setHelpOpen(false)}
-                className="mt-8 w-full rounded-xl bg-amber-400 px-6 py-4 font-mono text-[14px] font-semibold uppercase tracking-hud-tight text-[#231603] transition-colors hover:bg-amber-300"
+                className="mt-3 w-full rounded-xl bg-amber-400 px-6 py-4 font-mono text-[14px] font-semibold uppercase tracking-hud-tight text-[#231603] transition-colors hover:bg-amber-300"
               >
                 Got it
               </button>
