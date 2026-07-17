@@ -33,12 +33,40 @@ const IS_CONSTRAINED = (() => {
 })();
 
 const POINT_BUDGET = IS_CONSTRAINED ? 2000000 : 4500000;
-/* LAZ peaks at ~1x file inside the wasm heap; LAS is streamed in blocks */
-const MAX_LAZ_BYTES = (IS_CONSTRAINED ? 300 : 500) * 1024 * 1024;
-const MAX_LAS_BYTES = (IS_CONSTRAINED ? 600 : 1600) * 1024 * 1024;
+
+const MB = 1024 * 1024;
+/* Plain (non-COPC) .laz must be decompressed whole inside the wasm heap — capped.
+   .las streams in 32 MB blocks and .copc.laz streams by octree node, so both
+   open at any size; the LAS bound below is only a sanity ceiling. */
+const MAX_PLAIN_LAZ_BYTES = (IS_CONSTRAINED ? 300 : 500) * MB;
+const MAX_LOCAL_LAS_BYTES = 200 * 1024 * MB;
+/* The full-download fallback (hosts without range support) holds the whole
+   file in memory, so it keeps the old, tighter caps. */
+const MAX_DOWNLOAD_LAZ_BYTES = MAX_PLAIN_LAZ_BYTES;
+const MAX_DOWNLOAD_LAS_BYTES = (IS_CONSTRAINED ? 600 : 1600) * MB;
 
 const TOO_LARGE_MSG =
-  "This file is too large to open in a web browser. Contact us and we'll send a lighter version of the scan.";
+  "This compressed scan is too large to open whole in a browser. Run it through the AeroData COPC converter (Make-COPC) for a streaming version that opens at any size — or contact us and we'll send one.";
+
+/* Sniff the LAS 1.4 header for the COPC info VLR — COPC files stream, so
+   they're exempt from the plain-LAZ size cap even if renamed. */
+const isCopcBlob = async (file) => {
+  try {
+    const dv = new DataView(await file.slice(0, 440).arrayBuffer());
+    if (dv.byteLength < 395) return false;
+    const sig = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
+    if (sig !== "LASF" || dv.getUint8(25) < 4) return false;
+    let userId = "";
+    for (let i = 377; i < 393; i++) {
+      const b = dv.getUint8(i);
+      if (!b) break;
+      userId += String.fromCharCode(b);
+    }
+    return userId === "copc" && dv.getUint16(393, true) === 1;
+  } catch {
+    return false;
+  }
+};
 
 const COLOR_MODES = [
   { id: "elevation", label: "Height" },
@@ -90,6 +118,7 @@ export default function ViewerApp() {
   const fileInputRef = useRef(null);
   const folderInputRef = useRef(null);
   const pendingSkipRef = useRef(0);
+  const streamFallbackRef = useRef(null);
   const loadGenRef = useRef(0);
   const abortRef = useRef(null);
   const helpButtonRef = useRef(null);
@@ -108,6 +137,7 @@ export default function ViewerApp() {
     abortRef.current = null;
     workerRef.current?.terminate();
     workerRef.current = null;
+    streamFallbackRef.current = null;
     return ++loadGenRef.current;
   };
   const isStale = (gen) => gen !== loadGenRef.current;
@@ -146,6 +176,17 @@ export default function ViewerApp() {
       } else if (msg.type === "error") {
         worker.terminate();
         workerRef.current = null;
+        const fb = streamFallbackRef.current;
+        if (fb && fb.gen === loadGenRef.current) {
+          streamFallbackRef.current = null;
+          if (msg.code === "RANGE") {
+            /* host doesn't support streaming — download the file instead */
+            downloadUrl(fb.src, fb.gen);
+            return;
+          }
+          setStage({ kind: "error", message: msg.message, retrySrc: fb.src });
+          return;
+        }
         setStage({ kind: "error", message: msg.message });
       }
     };
@@ -162,7 +203,7 @@ export default function ViewerApp() {
     return worker;
   };
 
-  const openFiles = (list) => {
+  const openFiles = async (list) => {
     const all = Array.from(list || []).filter(Boolean);
     if (!all.length) return;
     const viewing = sceneRef.current !== null;
@@ -182,9 +223,22 @@ export default function ViewerApp() {
     const usable = [];
     let tooBig = 0;
     for (const f of scans) {
-      const cap = /\.laz$/i.test(f.name) ? MAX_LAZ_BYTES : MAX_LAS_BYTES;
-      if (f.size > cap) tooBig++;
-      else usable.push(f);
+      if (/\.laz$/i.test(f.name)) {
+        /* COPC streams at any size; only plain LAZ needs the whole-file cap */
+        if (
+          f.size <= MAX_PLAIN_LAZ_BYTES ||
+          /\.copc\.laz$/i.test(f.name) ||
+          (await isCopcBlob(f))
+        ) {
+          usable.push(f);
+        } else {
+          tooBig++;
+        }
+      } else if (f.size <= MAX_LOCAL_LAS_BYTES) {
+        usable.push(f);
+      } else {
+        tooBig++;
+      }
     }
     if (!usable.length) {
       if (viewing) return;
@@ -211,11 +265,27 @@ export default function ViewerApp() {
     startWorker().postMessage({ type: "demo", budget: POINT_BUDGET });
   };
 
-  const openUrl = async (src) => {
+  /* Streaming-first: hand the URL to the worker, which reads it with HTTP
+     range requests (COPC and LAS work at any size). If the host doesn't
+     support ranges, the worker reports code "RANGE" and we fall back to
+     downloading the whole file (with the old size caps). */
+  const openUrl = (src) => {
     const gen = beginLoad();
+    loadSceneModule();
+    let href = src;
+    try {
+      href = new URL(src, window.location.href).href;
+    } catch {
+      /* keep raw src */
+    }
+    streamFallbackRef.current = { gen, src };
+    setStage({ kind: "loading", percent: 0, phase: "Connecting to the scan…" });
+    startWorker().postMessage({ type: "parse", files: [{ url: href }], budget: POINT_BUDGET });
+  };
+
+  const downloadUrl = async (src, gen) => {
     const ac = new AbortController();
     abortRef.current = ac;
-    loadSceneModule();
     let reader = null;
     try {
       setStage({ kind: "loading", percent: 0, phase: "Downloading the scan…" });
@@ -226,7 +296,7 @@ export default function ViewerApp() {
         /* keep raw src */
       }
       /* unknown extensions get the stricter LAZ cap */
-      const cap = /\.las$/i.test(pathname) ? MAX_LAS_BYTES : MAX_LAZ_BYTES;
+      const cap = /\.las$/i.test(pathname) ? MAX_DOWNLOAD_LAS_BYTES : MAX_DOWNLOAD_LAZ_BYTES;
 
       const res = await fetch(src, { signal: ac.signal });
       if (isStale(gen)) return;
@@ -631,7 +701,8 @@ export default function ViewerApp() {
                 }}
               />
               <p className="text-sm text-slate-400">
-                Works with .las and .laz files — tiled scans open together as one map
+                Works with .las, .laz, and .copc.laz files — tiled scans open
+                together as one map
               </p>
             </div>
 

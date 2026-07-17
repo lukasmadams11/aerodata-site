@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "copc": "^0.0.8",
     "laz-perf": "^0.0.7",
     "lucide-react": "^0.525.0",
     "react": "^19.1.0",
