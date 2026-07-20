@@ -95,6 +95,22 @@ const COLOR_MODES = [
 const formatPoints = (n) =>
   n >= 1e6 ? `${(n / 1e6).toFixed(1)} million` : n.toLocaleString();
 
+/* Terra deliverables ship both merged and per-tile scans of the SAME data
+   (terra_las/cloud_merged.las alongside cloud0..N.las). Loading both would
+   double the work and the memory. When a "merged"/"combined" scan is
+   present, drop the numbered tiles. Also collapse 3DGS LOD duplicates to
+   the highest level so a folder pick doesn't stack every LOD of every tile. */
+function dedupeScanSet(files) {
+  const merged = files.filter((f) => /(merged|combined|full|all)/i.test(f.name));
+  if (merged.length && merged.length < files.length) {
+    const tiles = files.filter(
+      (f) => !merged.includes(f) && /(^|[^a-z])(cloud|tile|block|part)\s*[-_]?\d/i.test(f.name)
+    );
+    if (tiles.length) return files.filter((f) => !tiles.includes(f));
+  }
+  return files;
+}
+
 /* Lazy-load the 3D chunk (three.js) only when a scan is actually opened */
 let scenePromise = null;
 const loadSceneModule = () => (scenePromise ??= import("./PointCloudScene.js"));
@@ -310,19 +326,60 @@ export default function ViewerApp() {
     });
   };
 
+  /* Folder picks can carry tens of thousands of files (a full Terra delivery
+     is ~37k). Show feedback the instant the picker returns, then yield a
+     frame so the browser paints it before we filter — otherwise a big
+     folder looks like "nothing happened". */
+  const pickFromFolder = (list) => {
+    const count = list?.length || 0;
+    diag("pickFromFolder", { count });
+    if (!count) return;
+    beginLoad();
+    setStage({
+      kind: "loading",
+      percent: null,
+      phase: count > 4000 ? "Reading the folder — this can take a moment…" : "Reading the folder…",
+    });
+    /* snapshot to a plain array now (the input will be cleared) */
+    const files = Array.from(list);
+    setTimeout(() => {
+      try {
+        openFiles(files);
+      } catch (err) {
+        diag("openFiles threw", { msg: String(err?.message || err).slice(0, 150) });
+        setStage({
+          kind: "error",
+          message:
+            "That folder couldn't be opened. Try picking just the terra_las (or lidars) subfolder, or the single merged .las file.",
+        });
+      }
+    }, 60);
+  };
+
   const openFiles = async (list) => {
     const all = Array.from(list || []).filter(Boolean);
     if (!all.length) return;
     const viewing = sceneRef.current !== null;
-    const scans = all.filter((f) => /\.la[sz]$/i.test(f.name));
+    const rawScans = all.filter((f) => /\.la[sz]$/i.test(f.name));
     const splats = all.filter((f) => SPLAT_RE.test(f.name));
+    /* collapse Terra's merged-plus-tiles duplication to one set */
+    const scans = dedupeScanSet(rawScans);
+    const dropped = rawScans.length - scans.length;
     diag("openFiles", {
       total: all.length,
+      rawScans: rawScans.length,
       scans: scans.length,
+      dropped,
       splats: splats.length,
       first: (scans[0] || splats[0] || all[0])?.name,
       firstMB: Math.round(((scans[0] || splats[0] || all[0])?.size || 0) / 1048576),
     });
+    if (dropped > 0) {
+      showNotice(
+        `Loaded the combined scan and skipped ${dropped} duplicate tile${dropped > 1 ? "s" : ""} of the same data.`,
+        7000
+      );
+    }
     if (!scans.length && splats.length) {
       openSplatOnly(splats[0]);
       if (splats.length > 1) {
@@ -375,7 +432,9 @@ export default function ViewerApp() {
     releaseSplatUrl();
     loadSceneModule();
     pendingSkipRef.current = tooBig;
-    pendingSplatRef.current = splats[0] || null;
+    /* only auto-pair a photo view for a deliberate scan+model pick; a giant
+       folder with dozens of LOD tiles shouldn't attach an arbitrary one */
+    pendingSplatRef.current = splats.length === 1 ? splats[0] : null;
     sourceRef.current = { files: usable, center: null };
     sharpenedRef.current = false;
     snapshotRef.current = null;
@@ -1044,13 +1103,22 @@ export default function ViewerApp() {
                 aria-hidden="true"
                 onClick={(e) => e.stopPropagation()}
                 onChange={(e) => {
-                  openFiles(e.target.files);
+                  /* snapshot BEFORE clearing — value="" empties e.target.files */
+                  const files = Array.from(e.target.files || []);
                   e.target.value = "";
+                  pickFromFolder(files);
                 }}
               />
               <p className="text-sm text-slate-400">
                 Works with .las, .laz, and .copc.laz scans and 3D photo models
-                (.ply / .splat / .ksplat) — tiled scans open together as one map
+                (.ply / .splat / .ksplat) — tiled scans open together as one map.
+              </p>
+              <p className="max-w-md text-[13px] text-slate-500">
+                Big delivery folder? You can pick just the{" "}
+                <span className="font-mono text-slate-400">terra_las</span> (or{" "}
+                <span className="font-mono text-slate-400">lidars</span>) subfolder,
+                or choose the single merged <span className="font-mono text-slate-400">.las</span> file — it
+                opens faster.
               </p>
             </div>
 
