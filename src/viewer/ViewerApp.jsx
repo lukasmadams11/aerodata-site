@@ -807,6 +807,15 @@ export default function ViewerApp() {
         strikes++;
         if (strikes >= 2) {
           diag("BLACK SCREEN DETECTED");
+          if (dataRef.current && s.mode === "splat") {
+            /* a scan is loaded but a blank photo view is covering it —
+               recover automatically instead of leaving the user stranded */
+            diag("auto-recovered to scan view");
+            setViewMode("points");
+            showNotice("The photo view went blank — switched back to your scan.", 6000);
+            strikes = 0;
+            return;
+          }
           setBlackDetected(true);
           clearInterval(id);
         }
@@ -836,6 +845,23 @@ export default function ViewerApp() {
       .then((count) => {
         if (cancelled) return;
         diag("splat loaded", { count });
+        if (!count) {
+          /* parsed but EMPTY (e.g. a non-splat .ply from Terra's AT folder).
+             Never switch to an empty photo view — that IS the black screen. */
+          releaseSplatUrl();
+          sceneRef.current?.setMode("points");
+          setViewMode("points");
+          if (dataRef.current) {
+            showNotice("That 3D photo file was empty — showing the scan instead.", 6000);
+          } else {
+            setStage({
+              kind: "error",
+              message:
+                "This .ply file doesn't contain a 3D photo model. Terra's photo models are the point_cloud.ply files inside the 3dgs_ply folder — or contact us and we'll help.",
+            });
+          }
+          return;
+        }
         /* keep the object URL alive — a GPU-reset rebuild needs to reload it */
         setSplatState({ count });
         setViewMode("splat");
